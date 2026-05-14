@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Per-session data (timestamps, local stats — keep private)
+sessions/
+
+# Screenshots from `s` key during testing
+shot_*.png
+
+# Claude Code local state
+.claude/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
