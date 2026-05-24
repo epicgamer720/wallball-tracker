@@ -45,17 +45,8 @@ import cv2
 # --- Tunables ------------------------------------------------------------
 FRAME_W, FRAME_H = 640, 480    # tuned for 120fps on OV9782 / similar global-shutter cams
 TARGET_FPS       = 120         # ask the camera to push this hard; harmless on slow cams
-DISPLAY_EVERY_N  = 8           # only render to screen every Nth frame
-                               #   capture 120fps -> display ~15fps; tracking still uses all frames
-
-# Anti-jitter EMA on the detected ball position.  alpha = 1.0 means no
-# smoothing.  Lower = more smoothing + more lag.  0.5 ≈ half a frame of
-# lag at 100 fps, kills most pixel-level edge noise.
-BALL_EMA_ALPHA   = 0.5
-
-# Core/thread layout. The Pi has 8 cores; we give cv2 6 threads and leave
-# 2 spare for the GStreamer pipeline (videoconvert + appsink + python main).
-CV_INTERNAL_THREADS = 6
+DISPLAY_EVERY_N  = 4           # only render to screen every Nth frame
+                               #   capture 120fps -> display 30fps; tracking still uses all frames
 
 # Yellow ball — two-range HSV (saturated body OR bright specular highlight).
 HSV_LOW_A  = np.array([15, 100,  60], dtype=np.uint8)
@@ -135,63 +126,6 @@ GROUND_LOST_GRACE_S = 0.4
 
 # --- Camera (same multi-backend logic as tracker.py) ---------------------
 
-class ThreadedDisplay:
-    """cv2.imshow + cv2.waitKey on a background thread.  Main thread's
-    show() is non-blocking — it just stores the latest BGR frame per
-    window and notifies the display thread.  The display thread pulls
-    the snapshot and does the (relatively slow) X/Wayland render.
-
-    Keyboard events are captured by the display thread's waitKey() and
-    exposed via get_key()."""
-
-    def __init__(self):
-        self._latest    = {}        # title -> latest BGR frame
-        self._stop      = False
-        self._cond      = threading.Condition()
-        self._last_key  = -1
-        self._thread    = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def show(self, title, frame):
-        with self._cond:
-            self._latest[title] = frame
-            self._cond.notify_all()
-
-    def _loop(self):
-        while not self._stop:
-            with self._cond:
-                if not self._latest:
-                    self._cond.wait(timeout=0.1)
-                snap = list(self._latest.items())
-                self._latest.clear()
-            for title, frame in snap:
-                try:
-                    cv2.imshow(title, frame)
-                except Exception:
-                    pass
-            try:
-                k = cv2.waitKey(1) & 0xFF
-            except Exception:
-                k = 255
-            if k != 255:
-                self._last_key = k
-
-    def get_key(self):
-        k = self._last_key
-        self._last_key = -1
-        return k
-
-    def stop(self):
-        with self._cond:
-            self._stop = True
-            self._cond.notify_all()
-        self._thread.join(timeout=1.0)
-        try:
-            cv2.destroyAllWindows()
-        except Exception:
-            pass
-
-
 class ThreadedCapture:
     """Background thread that continuously calls the underlying read() and
     keeps the *latest* frame available.  Main thread reads via read()
@@ -242,48 +176,6 @@ class ThreadedCapture:
         self._thread.join(timeout=1.0)
 
 
-def _try_open_gstreamer(w, h, target_fps):
-    """Try a GStreamer pipeline with hardware-accelerated MJPEG decode
-    (Rockchip MPP).  Returns (cap, src_label) or (None, error_string)."""
-    if not sys.platform.startswith("linux"):
-        return None, "not linux"
-    # Probe for the hardware decoder element.  We try mppjpegdec (Rockchip),
-    # then v4l2jpegdec (Mainline V4L2 m2m), then plain jpegdec (CPU but
-    # GStreamer's pipelined version still beats OpenCV's single-shot decode).
-    import subprocess
-    decoder = None
-    for el in ("mppjpegdec", "v4l2jpegdec", "jpegdec"):
-        try:
-            res = subprocess.run(
-                ["gst-inspect-1.0", el],
-                capture_output=True, timeout=2, text=True)
-            if res.returncode == 0 and res.stdout.strip():
-                decoder = el
-                break
-        except Exception:
-            continue
-    if decoder is None:
-        return None, "no jpeg decoder element found"
-    pipeline = (
-        f"v4l2src device=/dev/video0 io-mode=4 ! "
-        f"image/jpeg,width={w},height={h},framerate={target_fps}/1 ! "
-        f"{decoder} ! videoconvert n-threads=4 ! "
-        f"video/x-raw,format=BGR ! "
-        f"appsink drop=true sync=false max-buffers=1"
-    )
-    cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-    if not cap.isOpened():
-        return None, f"pipeline failed to open ({decoder})"
-    time.sleep(0.5)
-    for _ in range(10):
-        ok, _f = cap.read()
-        if ok:
-            return cap, f"GST:{decoder}"
-        time.sleep(0.1)
-    cap.release()
-    return None, f"pipeline opened but no frames ({decoder})"
-
-
 def open_camera(w, h):
     try:
         from picamera2 import Picamera2  # type: ignore
@@ -298,23 +190,6 @@ def open_camera(w, h):
         return read, cam.stop, "picamera2"
     except Exception:
         pass
-
-    # Try the GStreamer hardware-decode pipeline first on Linux.
-    cap, label = _try_open_gstreamer(w, h, TARGET_FPS)
-    if cap is not None:
-        def make_read(c):
-            def _read():
-                for _ in range(3):
-                    ok, fr = c.read()
-                    if ok:
-                        return True, fr
-                    time.sleep(0.005)
-                return False, None
-            return _read
-        return make_read(cap), cap.release, label
-    else:
-        print(f"GStreamer hw-decode path unavailable: {label}; "
-              f"falling back to V4L2.")
 
     backends = [("DSHOW", cv2.CAP_DSHOW), ("MSMF", cv2.CAP_MSMF),
                 ("ANY",   cv2.CAP_ANY)] \
@@ -708,13 +583,6 @@ def main():
 
     wall_dir = +1 if args.wall_side == "right" else -1
 
-    # Cap OpenCV's internal thread pool so it doesn't fight with the
-    # GStreamer pipeline for cores.
-    try:
-        cv2.setNumThreads(CV_INTERNAL_THREADS)
-    except Exception:
-        pass
-
     if args.video:
         cap = cv2.VideoCapture(args.video)
         if not cap.isOpened():
@@ -722,21 +590,12 @@ def main():
         read, release, src = cap.read, cap.release, "file"
     else:
         raw_read, raw_release, src = open_camera(FRAME_W, FRAME_H)
-        if src.startswith("GST:"):
-            # GStreamer's appsink (drop=true max-buffers=1) already only keeps
-            # the freshest frame and decodes in its own thread pool, so an
-            # extra Python-side capture thread is both redundant and can
-            # deadlock against the imshow-window-creation pause.
-            threaded = None
-            read = raw_read
-            release = raw_release
-        else:
-            # Decouple capture from processing for the V4L2/MSMF/DSHOW paths.
-            threaded = ThreadedCapture(raw_read)
-            read = threaded.read
-            def release():
-                threaded.release()
-                raw_release()
+        # Decouple capture from processing — capture runs on its own thread/core.
+        threaded = ThreadedCapture(raw_read)
+        read = threaded.read
+        def release():
+            threaded.release()
+            raw_release()
     print(f"source: {src}  wall: {args.wall_side}")
 
     log_path = os.path.join(
@@ -747,7 +606,6 @@ def main():
 
     cadence = CadenceTracker()
     pose = PoseEstimator()           # <-- swap in a real estimator here later
-    display = None if args.no_display else ThreadedDisplay()
 
     trail = collections.deque(maxlen=TRAIL_LEN)
     kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -755,7 +613,6 @@ def main():
     fps_window = collections.deque(maxlen=60)   # last 60 frame timestamps
     frame_idx  = 0
     last_fps_print = time.time()
-    prev_filt_pos = None    # EMA-smoothed (cx, cy) from previous frame
 
     start = time.time()
     rep_count        = 0
@@ -788,10 +645,10 @@ def main():
                 cur_fps = 0.0
             # Periodic diagnostic: print main-loop and capture-thread fps.
             if (time.time() - last_fps_print) >= 2.0:
-                if threaded is not None:
+                try:
                     cap_fps = threaded.capture_fps()
-                else:
-                    cap_fps = cur_fps    # no separate capture thread
+                except NameError:
+                    cap_fps = 0.0
                 print(f"[fps] main={cur_fps:.1f}  capture={cap_fps:.1f}  "
                       f"trail={len(trail)}", flush=True)
                 last_fps_print = time.time()
@@ -837,15 +694,7 @@ def main():
                     best = (float(cx), float(cy), float(rr))
 
             if best is not None:
-                cx_raw, cy_raw, rr = best
-                # EMA smoothing: kill sub-pixel jitter without much lag.
-                if prev_filt_pos is None:
-                    cx, cy = cx_raw, cy_raw
-                else:
-                    a = BALL_EMA_ALPHA
-                    cx = a * cx_raw + (1.0 - a) * prev_filt_pos[0]
-                    cy = a * cy_raw + (1.0 - a) * prev_filt_pos[1]
-                prev_filt_pos = (cx, cy)
+                cx, cy, rr = best
                 trail.append((now, cx, cy, rr))
                 last_seen_at = now
                 last_seen_pos = (cx, cy)
@@ -854,10 +703,6 @@ def main():
                                (0, 255, 255), 2)
                     cv2.circle(frame, (int(cx), int(cy)), 3,
                                (0, 0, 255), -1)
-            else:
-                # Reset the filter when tracking is lost so the next
-                # detection (often after a throw/catch) starts crisp.
-                prev_filt_pos = None
 
             # --- Trail polyline (display only) ---------------------------
             if do_draw:
@@ -1030,10 +875,10 @@ def main():
                 cv2.arrowedLine(frame, (50, y_arr), (10, y_arr),
                                 (0, 200, 255), 3, tipLength=0.4)
 
-            if display is not None:
-                display.show("wall ball", frame)
-                display.show("mask", mask)
-                k = display.get_key()
+            if not args.no_display:
+                cv2.imshow("wall ball", frame)
+                cv2.imshow("mask", mask)
+                k = cv2.waitKey(1) & 0xFF
                 if k == ord('q'):
                     break
                 if k == ord('r'):
@@ -1046,7 +891,6 @@ def main():
                     drop_armed = False
                     cooldown_until = 0.0
                     last_seen_pos = None
-                    prev_filt_pos = None
                     print("session reset")
                 if k == ord('s'):
                     fn = f"shot_{int(time.time())}.png"
@@ -1064,13 +908,7 @@ def main():
         }
         logger.close(summary)
         release()
-        if display is not None:
-            display.stop()
-        else:
-            try:
-                cv2.destroyAllWindows()
-            except Exception:
-                pass
+        cv2.destroyAllWindows()
         print()
         print("=== Session summary ===")
         for k, v in summary.items():
