@@ -35,8 +35,6 @@ import json
 import math
 import os
 import queue
-import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -52,10 +50,11 @@ import cv2
 
 
 # --- Tunables ------------------------------------------------------------
-FRAME_W, FRAME_H = 1280, 720   # 10% fewer pixels than 1280x800, supports 60fps cleanly
-TARGET_FPS       = 60
-DISPLAY_EVERY_N  = 8           # only render to screen every Nth frame
-                               #   capture 120fps -> display ~15fps; tracking still uses all frames
+FRAME_W, FRAME_H = 640, 480    # sweet spot: ~4x lighter than 1280, smoother tracking
+TARGET_FPS       = 120         # OV9782 does 640x480@120; more frames = denser trail
+DISPLAY_EVERY_N  = 1           # render every frame (cheap at 30fps capture).
+                               # Bump up if pushing 100+ fps capture so the
+                               # display thread stops being the bottleneck.
 
 # Anti-jitter: One-Euro filter (Casiez et al, 2012).  Adaptive smoothing
 # that's *heavy* on slow / stationary input (kills pixel-edge noise) and
@@ -81,15 +80,22 @@ HSV_LOW_B  = np.array([15,  20, 235], dtype=np.uint8)
 HSV_HIGH_B = np.array([42,  95, 255], dtype=np.uint8)
 
 MIN_RADIUS_PX     = 5          # LOOSE: only used in tracking mode (we have an anchor)
-MAX_RADIUS_PX     = 220
-MIN_CIRCULARITY   = 0.40       # LOOSE: only used in tracking mode
+MAX_RADIUS_PX     = 100        # human torsos in frame are >>100px — reject by size
+MIN_CIRCULARITY   = 0.40       # LOOSE-mode floor.  A finger across the ball
+                               # can drop circularity to ~0.5, so we need to
+                               # let those through.  Roundness still dominates
+                               # the score via the circ^2 term below.
 
 # STRICT gates for re-acquire mode (no anchor — we just lost the ball or
 # haven't found it yet).  At this point we don't want every yellow speck
 # competing for "biggest score" — we want only an obvious ball-shaped
 # blob to qualify.  Once acquired, the loose gates above kick in so
 # partial occlusion doesn't drop us back into re-acquire.
-MIN_RADIUS_PX_STRICT    = 12
+#
+# 22px radius -> ~1500 px^2 minimum area; tiny background specks are
+# rejected outright, even if they're perfectly round.  Combined with the
+# `circ * area` score below, a real ball crushes any plausible noise blob.
+MIN_RADIUS_PX_STRICT    = 22
 MIN_CIRCULARITY_STRICT  = 0.60
 TRAIL_MAX_AGE_S   = 1.0
 TRAIL_LEN         = 240        # generous for high-fps cameras
@@ -98,17 +104,64 @@ TRAIL_LEN         = 240        # generous for high-fps cameras
 #   - HARD REJECT contours whose center is farther than TRACK_HARD_PX
 #     from the last ball position.  Kills "yellow speck across the frame
 #     becomes the ball" entirely.
-#   - HARD REJECT contours whose radius differs from the last by more
-#     than TRACK_SIZE_TOL (a real ball doesn't shrink/grow 2× in one
-#     frame).
+#   - HARD REJECT contours that GREW by more than TRACK_GROW_TOL — a
+#     real ball doesn't suddenly get bigger, but partial occlusion makes
+#     it look smaller, so shrinking is allowed (down to TRACK_SHRINK_TOL).
 #   - Soft proximity bonus for continuity (keeps the closest blob winning).
-# Anchor is dropped if we haven't seen the ball for TRACK_LOST_GAP_S
-# (then we fall back to global search to re-acquire).
-TRACK_HARD_PX       = 220.0    # 1280-wide frame, ball moves ~30-80 px/frame at 60fps
-TRACK_SIZE_TOL      = 0.55     # max fractional radius change between frames
-TRACK_SEARCH_PX     = 110.0    # scale of soft proximity bonus
-TRACK_BONUS         = 3.0
-TRACK_LOST_GAP_S    = 0.30
+# Strict-tracking anchor is dropped after TRACK_LOST_GAP_S.  After that,
+# a softer "ghost anchor" (last known position only, no size lock) keeps
+# providing a spatial prior for up to GHOST_ANCHOR_GAP_S so re-acquire
+# prefers the ball where we last saw it instead of glueing onto a
+# distant spec.
+TRACK_HARD_PX           = 120.0  # 640-wide frame; rejects far-off blobs while tracking
+TRACK_GROW_TOL          = 0.35   # reject contours that grew >35% vs anchor
+TRACK_SHRINK_TOL        = 0.60   # allow shrinking down to 40% of anchor (partial occlusion)
+                                 # — tighter than 0.85 so the tracker can't
+                                 # latch onto a small chunk of body/clothing
+                                 # near the last position.
+TRACK_SEARCH_PX         = 110.0  # scale of soft proximity bonus
+TRACK_BONUS             = 3.0
+TRACK_LOST_GAP_S        = 0.30
+
+# Ghost-anchor (position-only memory after the strict anchor expires).
+# Survives brief occlusion — when the ball emerges, the visible blob near
+# the last-known location wins via proximity bonus.  Tuned softer than
+# the strict tracking anchor: if the bonus is too strong, walking in
+# front of the camera makes the tracker glue onto body/clothing right
+# where the ball was.
+GHOST_ANCHOR_GAP_S      = 2.0
+GHOST_ANCHOR_RANGE_PX   = 130.0
+GHOST_ANCHOR_BONUS      = 2.0    # mild bias, not a takeover
+
+# Fragment-fit fallback: when the ball is heavily occluded by a lacrosse
+# stick mesh or a hand, no single contour looks like a ball.  Instead the
+# ball shows up as one C-shape (finger across ball) or N small fragments
+# (mesh).  Whatever the geometry, the visible ball EDGE points all lie on
+# the ball's circle — we just have to ignore the non-edge points (finger
+# chord, interior speckle, etc.) when fitting.
+#
+# Strategy: from every contour, keep only points whose distance from the
+# anchor center lies in the "expected edge band" (FRAG_EDGE_INNER_R to
+# FRAG_EDGE_OUTER_R times anchor.r).  Those are real ball-arc points.
+# Points on a finger chord lie INSIDE the ball circle (closer than the
+# inner-band cutoff) and get dropped — they no longer bias the fit.
+#
+# Random yellow specks don't lie on a common circle, so even if a few of
+# their points fall in the band, the residual check rejects them.
+#
+# Only runs when (anchor is set) AND the normal best-contour pick was
+# missing or smaller than the expected ball.
+FRAGMENT_FIT_TRIGGER_R  = 0.85   # trigger fallback if best.r < anchor.r * this
+FRAGMENT_MIN_AREA       = 6      # ignore tiny noise specks
+FRAGMENT_MIN_POINTS     = 6      # need >= this many edge-band points to fit
+FRAG_EDGE_INNER_R       = 0.85   # keep points with dist >= this * anchor.r
+                                 # (tight enough to drop most finger-chord
+                                 # points, loose enough for ~10% anchor.r
+                                 # uncertainty + pixel discretization)
+FRAG_EDGE_OUTER_R       = 1.15   # keep points with dist <= this * anchor.r
+FRAGMENT_CENTER_TOL     = 0.45   # fitted center within anchor.r * this of anchor
+FRAGMENT_RADIUS_TOL     = 0.30   # fitted radius within 30% of anchor radius
+FRAGMENT_RESIDUAL_PX    = 4.0    # median |dist-to-circle| must be <= this
 
 # Parabolic-fit thresholds — loosened so fast, blurry, near-straight wall
 # ball throws still produce a candidate.  The speed gates below do the real
@@ -177,8 +230,6 @@ HSV_CALIB_PATH      = "hsv_calibration.json"
 HSV_SAMPLE_BOX_PX   = 60        # side of the center crosshair sampling box
 HSV_MARGIN          = np.array([4, 30, 35], dtype=np.int16)  # H, S, V — tight enough to exclude skin
 
-# --- Exposure / WB ------------------------------------------------------
-AE_CONVERGE_S       = 3.0       # seconds of auto before we lock
 # -------------------------------------------------------------------------
 
 
@@ -226,110 +277,6 @@ class OneEuroFilter:
         self.dx_prev = dx_hat
         self.t_prev  = t
         return x_hat
-
-
-# --- v4l2-ctl helpers (graceful no-op if v4l2-ctl missing) --------------
-
-def _have_v4l2ctl():
-    return shutil.which("v4l2-ctl") is not None
-
-
-def _v4l2_get(device, ctrl):
-    """Return the integer value of a v4l2 control, or None on failure."""
-    if not _have_v4l2ctl():
-        return None
-    try:
-        out = subprocess.run(
-            ["v4l2-ctl", "-d", device, f"--get-ctrl={ctrl}"],
-            capture_output=True, text=True, timeout=2)
-        if out.returncode != 0:
-            return None
-        # "ctrl_name: value"
-        return int(out.stdout.split(":", 1)[1].strip())
-    except Exception:
-        return None
-
-
-def _v4l2_set(device, **ctrls):
-    """Set v4l2 controls. Returns True if v4l2-ctl ran without error."""
-    if not _have_v4l2ctl():
-        return False
-    args = ["v4l2-ctl", "-d", device]
-    for k, v in ctrls.items():
-        args.append(f"--set-ctrl={k}={v}")
-    try:
-        out = subprocess.run(args, capture_output=True, text=True, timeout=2)
-        return out.returncode == 0
-    except Exception:
-        return False
-
-
-def lock_exposure_and_wb(device="/dev/video0"):
-    """Read the currently-converged auto exposure / WB values and freeze them.
-    Returns a dict describing what got locked (for the HUD), or None."""
-    if not _have_v4l2ctl():
-        return None
-    expo = _v4l2_get(device, "exposure_time_absolute")
-    wb   = _v4l2_get(device, "white_balance_temperature")
-    gain = _v4l2_get(device, "gain")
-    # Switch off auto-exposure (1 = manual) and auto-WB.
-    _v4l2_set(device, exposure_auto=1)
-    _v4l2_set(device, white_balance_temperature_auto=0)
-    locked = {}
-    if expo is not None and _v4l2_set(device, exposure_time_absolute=expo):
-        locked["exposure"] = expo
-    if wb is not None and _v4l2_set(device, white_balance_temperature=wb):
-        locked["wb"] = wb
-    if gain is not None and _v4l2_set(device, gain=gain):
-        locked["gain"] = gain
-    return locked or None
-
-
-def unlock_exposure_and_wb(device="/dev/video0"):
-    """Re-enable auto exposure + auto WB so the camera re-converges."""
-    if not _have_v4l2ctl():
-        return False
-    ok = True
-    ok &= _v4l2_set(device, exposure_auto=3)               # 3 = aperture priority
-    ok &= _v4l2_set(device, white_balance_temperature_auto=1)
-    return ok
-
-
-def ball_exposure_step(frame, best, device="/dev/video0",
-                       target_v=200, damping=0.6):
-    """ONE step of a feedback loop that adjusts the camera's exposure so
-    the BALL pixels (not the whole scene) are exposed to ~target_v.
-
-    - Reads pixels inside the detected ball circle (best = cx,cy,r).
-    - Measures their mean V (HSV value channel).
-    - Sets camera exposure_time_absolute proportionally toward target_v,
-      damped so we don't oscillate.
-    Returns {v_ball, prev_expo, new_expo} or None if it couldn't run."""
-    if not _have_v4l2ctl() or best is None:
-        return None
-    cx, cy, r = int(best[0]), int(best[1]), max(int(best[2] * 0.6), 4)
-    h, w = frame.shape[:2]
-    roi = np.zeros((h, w), dtype=np.uint8)
-    cv2.circle(roi, (cx, cy), r, 255, -1)
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    v_samples = hsv[roi > 0, 2]
-    if v_samples.size < 50:
-        return None
-    cur_v = float(np.mean(v_samples))
-    cur_expo = _v4l2_get(device, "exposure_time_absolute")
-    if cur_expo is None or cur_expo <= 0:
-        return None
-    # Manual exposure; freeze gain to whatever it currently is so the camera
-    # doesn't sabotage us by raising gain to compensate for the cut.
-    cur_gain = _v4l2_get(device, "gain")
-    _v4l2_set(device, exposure_auto=1)
-    if cur_gain is not None:
-        _v4l2_set(device, gain=cur_gain)
-    ratio = target_v / max(cur_v, 1.0)
-    ratio = 1.0 + damping * (ratio - 1.0)
-    new_expo = max(1, min(int(cur_expo * ratio), 10000))
-    _v4l2_set(device, exposure_time_absolute=new_expo)
-    return {"v_ball": cur_v, "prev_expo": cur_expo, "new_expo": new_expo}
 
 
 # --- HSV calibration: sample-from-frame on key press --------------------
@@ -443,6 +390,88 @@ class ThreadedDisplay:
             pass
 
 
+def _fit_circle_algebraic(pts):
+    """Algebraic (Kasa) least-squares circle fit.
+    pts: Nx2 array of (x, y) points.
+    Returns (cx, cy, r, median_residual_px) or None if the fit is degenerate.
+
+    Linearizes (x-cx)^2 + (y-cy)^2 = r^2 as
+        2*cx*x + 2*cy*y + (r^2 - cx^2 - cy^2) = x^2 + y^2
+    and solves the resulting linear system in (cx, cy, c) where
+    c = r^2 - cx^2 - cy^2.  Fast (one np.linalg.lstsq), robust enough
+    for "points on a circle plus small noise" — which is our case
+    when fragments come from real ball edges."""
+    if len(pts) < 3:
+        return None
+    pts = np.asarray(pts, dtype=np.float64)
+    x = pts[:, 0]
+    y = pts[:, 1]
+    A = np.column_stack([2.0 * x, 2.0 * y, np.ones_like(x)])
+    b = x * x + y * y
+    try:
+        sol, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    cx, cy, c = float(sol[0]), float(sol[1]), float(sol[2])
+    r2 = c + cx * cx + cy * cy
+    if r2 <= 0.0:
+        return None
+    r = math.sqrt(r2)
+    dists = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+    return (cx, cy, r, float(np.median(np.abs(dists - r))))
+
+
+def _try_fragment_circle_fit(contours, anchor):
+    """Reconstruct ball position from edge points scattered across one or
+    more contours (occluded ball geometries).
+
+    Algorithm:
+      1. For every contour, vectorized-filter its points to keep ONLY
+         those whose distance from the anchor lies in the expected edge
+         band [FRAG_EDGE_INNER_R, FRAG_EDGE_OUTER_R] * anchor.r.  This
+         drops finger-chord points (inside the ball), interior speckle,
+         and far-away yellow blobs in one shot.
+      2. Fit a circle to the surviving edge-band points (Kasa).
+      3. Accept only if (a) fitted center is near the anchor, (b) fitted
+         radius matches the anchor, and (c) points actually lie on the
+         fitted circle (low median residual).
+
+    Returns (cx, cy, r) or None.  Random yellow specks fail (c)."""
+    ax, ay, ar = anchor[0], anchor[1], anchor[2]
+    if ar <= 0:
+        return None
+    inner_r2 = (ar * FRAG_EDGE_INNER_R) ** 2
+    outer_r2 = (ar * FRAG_EDGE_OUTER_R) ** 2
+    anchor_pt = np.array([ax, ay], dtype=np.float32)
+    edge_chunks = []
+    for c in contours:
+        if cv2.contourArea(c) < FRAGMENT_MIN_AREA:
+            continue
+        pts = c.reshape(-1, 2).astype(np.float32)
+        diff = pts - anchor_pt
+        dist_sq = diff[:, 0] * diff[:, 0] + diff[:, 1] * diff[:, 1]
+        in_band = (dist_sq >= inner_r2) & (dist_sq <= outer_r2)
+        if in_band.any():
+            edge_chunks.append(pts[in_band])
+    if not edge_chunks:
+        return None
+    edge_pts = np.concatenate(edge_chunks, axis=0)
+    if edge_pts.shape[0] < FRAGMENT_MIN_POINTS:
+        return None
+    fit = _fit_circle_algebraic(edge_pts)
+    if fit is None:
+        return None
+    fcx, fcy, fr, fres = fit
+    # Validate: fitted circle must look like the ball, not just any circle.
+    if math.hypot(fcx - ax, fcy - ay) > ar * FRAGMENT_CENTER_TOL:
+        return None    # center drifted too far from anchor
+    if abs(fr - ar) / ar > FRAGMENT_RADIUS_TOL:
+        return None    # wrong size
+    if fres > FRAGMENT_RESIDUAL_PX:
+        return None    # points don't actually lie on a common circle — specks
+    return (float(fcx), float(fcy), float(fr))
+
+
 class MaskContourWorker:
     """Background pipeline stage that does the heavy CV work — HSV mask,
     morphology, contour finding, ball-shape scoring — on its own thread.
@@ -471,17 +500,19 @@ class MaskContourWorker:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
-    def submit(self, frame, frame_idx, t, anchor=None):
-        """anchor: (cx, cy) of recent detection.  When set, contours near
-        this position get a score bonus so tracking stays locked through
-        partial occlusion."""
+    def submit(self, frame, frame_idx, t, anchor=None, ghost_anchor=None):
+        """anchor: (cx, cy, r) of recent detection — when set, enables
+            tracking mode (loose gates + size lock + proximity bonus).
+        ghost_anchor: (cx, cy) of last-known ball position — used in
+            re-acquire mode (strict gates) as a proximity prior so the
+            ball wins over distant specs when it reappears."""
         # Drop the previous unprocessed input; keep only the latest.
         try:
             self._in_q.get_nowait()
         except queue.Empty:
             pass
         try:
-            self._in_q.put_nowait((frame, frame_idx, t, anchor))
+            self._in_q.put_nowait((frame, frame_idx, t, anchor, ghost_anchor))
         except queue.Full:
             pass
 
@@ -498,7 +529,7 @@ class MaskContourWorker:
     def _loop(self):
         while not self._stop:
             try:
-                frame, frame_idx, t, anchor = self._in_q.get(timeout=0.1)
+                frame, frame_idx, t, anchor, ghost_anchor = self._in_q.get(timeout=0.1)
             except queue.Empty:
                 continue
             # Two-mode gates: strict if no anchor (re-acquire), loose if
@@ -548,8 +579,15 @@ class MaskContourWorker:
                         cy_m = M["m01"] / M["m00"]
                     else:
                         cx_m, cy_m = cx_c, cy_c
+                    # Score is mode-dependent.  When we have an anchor (or
+                    # a ghost anchor) the size gate has already filtered to
+                    # plausible ball-sized blobs, so AREA carries no useful
+                    # signal — it just helps big body chunks beat the actual
+                    # ball.  Use roundness + proximity only.  Only cold-start
+                    # uses area (to pick the obvious "biggest round yellow
+                    # thing" with no spatial prior).
                     if anchor is not None:
-                        # anchor = (cx, cy, r) of the last good detection.
+                        # Tracking mode — strict anchor (size + position lock).
                         dx = cx_m - anchor[0]
                         dy = cy_m - anchor[1]
                         dist = math.sqrt(dx * dx + dy * dy)
@@ -557,16 +595,53 @@ class MaskContourWorker:
                         # cannot possibly have moved to in one frame.
                         if dist > TRACK_HARD_PX:
                             continue
-                        # HARD REJECT — sudden size jump = not the same ball.
-                        if anchor[2] > 0 and abs(rr - anchor[2]) / anchor[2] > TRACK_SIZE_TOL:
-                            continue
+                        # Asymmetric size tolerance: shrinking is OK
+                        # (occlusion), growing past TRACK_GROW_TOL is not.
+                        if anchor[2] > 0:
+                            delta = (rr - anchor[2]) / anchor[2]
+                            if delta >  TRACK_GROW_TOL:
+                                continue
+                            if delta < -TRACK_SHRINK_TOL:
+                                continue
                         prox = math.exp(-dist / TRACK_SEARCH_PX)
-                        score = circ * math.sqrt(area) * (1.0 + TRACK_BONUS * prox)
+                        # circ^2 (roundness dominates) × proximity bonus.
+                        # No area term — size gate already constrains size.
+                        score = (circ * circ) * (1.0 + TRACK_BONUS * prox)
+                    elif ghost_anchor is not None:
+                        # Re-acquire mode WITH spatial memory — strict gates
+                        # filter min size/roundness; score by roundness +
+                        # proximity to last-known position.  No area term:
+                        # body chunks near the last position shouldn't win
+                        # just for being bigger than the actual ball.
+                        dx = cx_m - ghost_anchor[0]
+                        dy = cy_m - ghost_anchor[1]
+                        dist = math.sqrt(dx * dx + dy * dy)
+                        prox = math.exp(-dist / GHOST_ANCHOR_RANGE_PX)
+                        score = (circ * circ) * (1.0 + GHOST_ANCHOR_BONUS * prox)
                     else:
-                        score = circ * math.sqrt(area)
+                        # Cold start — no spatial info, area helps find the
+                        # obvious "big round yellow thing" against noise.
+                        score = (circ * circ) * math.sqrt(area)
                     if score > best_score:
                         best_score = score
                         best = (float(cx_m), float(cy_m), float(rr))
+
+                # --- Heavy-occlusion fallback (lacrosse mesh / hand). ----
+                # If we have an anchor (we know where the ball was) but no
+                # single contour passed as a plausible whole-ball detection
+                # — OR the best we got is much smaller than the anchor
+                # (heavy occlusion exposing only a fragment) — try to
+                # reconstruct the ball geometrically from multiple visible
+                # fragments lying on a common circle.
+                if anchor is not None and anchor[2] > 0:
+                    need_fit = (
+                        best is None
+                        or best[2] < anchor[2] * FRAGMENT_FIT_TRIGGER_R
+                    )
+                    if need_fit:
+                        synth = _try_fragment_circle_fit(contours, anchor)
+                        if synth is not None:
+                            best = synth
             except Exception:
                 continue
             # Replace any stale output with the new result.
@@ -634,87 +709,17 @@ class ThreadedCapture:
         self._thread.join(timeout=1.0)
 
 
-def _try_open_gstreamer(w, h, target_fps):
-    """Try a GStreamer pipeline with hardware-accelerated MJPEG decode
-    (Rockchip MPP).  Returns (cap, src_label) or (None, error_string)."""
-    if not sys.platform.startswith("linux"):
-        return None, "not linux"
-    # Probe for the hardware decoder element.  We try mppjpegdec (Rockchip),
-    # then v4l2jpegdec (Mainline V4L2 m2m), then plain jpegdec (CPU but
-    # GStreamer's pipelined version still beats OpenCV's single-shot decode).
-    import subprocess
-    decoder = None
-    for el in ("mppjpegdec", "v4l2jpegdec", "jpegdec"):
-        try:
-            res = subprocess.run(
-                ["gst-inspect-1.0", el],
-                capture_output=True, timeout=2, text=True)
-            if res.returncode == 0 and res.stdout.strip():
-                decoder = el
-                break
-        except Exception:
-            continue
-    if decoder is None:
-        return None, "no jpeg decoder element found"
-    pipeline = (
-        f"v4l2src device=/dev/video0 io-mode=4 ! "
-        f"image/jpeg,width={w},height={h},framerate={target_fps}/1 ! "
-        f"{decoder} ! videoconvert n-threads=4 ! "
-        f"video/x-raw,format=BGR ! "
-        f"appsink drop=true sync=false max-buffers=1"
-    )
-    cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-    if not cap.isOpened():
-        return None, f"pipeline failed to open ({decoder})"
-    time.sleep(0.5)
-    for _ in range(10):
-        ok, _f = cap.read()
-        if ok:
-            return cap, f"GST:{decoder}"
-        time.sleep(0.1)
-    cap.release()
-    return None, f"pipeline opened but no frames ({decoder})"
+def open_camera(w, h, return_cap=False):
+    """Plain V4L2 / DSHOW / MSMF camera open.  No GStreamer, no exposure
+    twiddling — the camera's own auto-exposure / auto-WB stays on.
 
-
-def open_camera(w, h):
-    try:
-        from picamera2 import Picamera2  # type: ignore
-        cam = Picamera2()
-        cam.configure(cam.create_video_configuration(
-            main={"size": (w, h), "format": "RGB888"}))
-        cam.start()
-        time.sleep(0.2)
-        def read():
-            arr = cam.capture_array()
-            return True, cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-        return read, cam.stop, "picamera2"
-    except Exception:
-        pass
-
-    # Try the GStreamer hardware-decode pipeline first on Linux.
-    cap, label = _try_open_gstreamer(w, h, TARGET_FPS)
-    if cap is not None:
-        def make_read(c):
-            def _read():
-                for _ in range(3):
-                    ok, fr = c.read()
-                    if ok:
-                        return True, fr
-                    time.sleep(0.005)
-                return False, None
-            return _read
-        return make_read(cap), cap.release, label
-    else:
-        print(f"GStreamer hw-decode path unavailable: {label}; "
-              f"falling back to V4L2.")
-
+    return_cap=True also returns the underlying cv2.VideoCapture as a 4th
+    element so callers (e.g. the web UI) can drive exposure / white-balance
+    controls.  Default stays a 3-tuple so existing callers are unaffected."""
     backends = [("DSHOW", cv2.CAP_DSHOW), ("MSMF", cv2.CAP_MSMF),
                 ("ANY",   cv2.CAP_ANY)] \
         if sys.platform.startswith("win") else \
         [("V4L2", cv2.CAP_V4L2), ("ANY", cv2.CAP_ANY)]
-        # V4L2 first on Linux — the GStreamer auto-pick negotiates YUYV
-        # at 10 fps and produces washed-out frames. Direct V4L2 + MJPG
-        # gives full-color 30+ fps on USB cams like the Arducam OV9782.
     last_err = None
 
     def try_open(idx, backend, set_res):
@@ -723,9 +728,9 @@ def open_camera(w, h):
             cap.release()
             return None
         if set_res:
-            # Best-effort. Some V4L2/GStreamer combos error out on a
-            # mid-stream resolution change; we just take the native size
-            # and resize in the main loop instead.
+            # Best-effort.  Camera ignores anything it can't deliver and
+            # falls back to its native size / fourcc; we resize in the
+            # main loop if needed.
             try:
                 # Request MJPEG first — most USB webcams deliver much higher
                 # fps + sharper frames in MJPEG than the default YUYV.
@@ -734,10 +739,6 @@ def open_camera(w, h):
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
                 cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
-                # Force auto-exposure + auto-WB on (3 = "aperture priority"
-                # in V4L2 nomenclature, which means auto-exposure ON).
-                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)
-                cap.set(cv2.CAP_PROP_AUTO_WB, 1)
                 # Smallest internal queue — always give us the freshest frame.
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             except Exception:
@@ -779,6 +780,8 @@ def open_camera(w, h):
                             time.sleep(0.02)
                         return False, None
                     return _read
+                if return_cap:
+                    return make_read(cap), cap.release, f"{name}:{idx}", cap
                 return make_read(cap), cap.release, f"{name}:{idx}"
         if attempt < 3:
             time.sleep(1.5)
@@ -1112,23 +1115,16 @@ def main():
         if not cap.isOpened():
             raise RuntimeError(f"Could not open {args.video}")
         read, release, src = cap.read, cap.release, "file"
+        threaded = None
     else:
         raw_read, raw_release, src = open_camera(FRAME_W, FRAME_H)
-        if src.startswith("GST:"):
-            # GStreamer's appsink (drop=true max-buffers=1) already only keeps
-            # the freshest frame and decodes in its own thread pool, so an
-            # extra Python-side capture thread is both redundant and can
-            # deadlock against the imshow-window-creation pause.
-            threaded = None
-            read = raw_read
-            release = raw_release
-        else:
-            # Decouple capture from processing for the V4L2/MSMF/DSHOW paths.
-            threaded = ThreadedCapture(raw_read)
-            read = threaded.read
-            def release():
-                threaded.release()
-                raw_release()
+        # Decouple capture I/O from processing — the read thread runs on
+        # its own core while the main loop runs on another.
+        threaded = ThreadedCapture(raw_read)
+        read = threaded.read
+        def release():
+            threaded.release()
+            raw_release()
     print(f"source: {src}  wall: {args.wall_side}")
 
     log_path = os.path.join(
@@ -1183,16 +1179,7 @@ def main():
     held_info        = None
     label_hold_until = 0.0
     drop_armed       = False   # set True after each rep; clears after a drop fires
-    # AE/WB stays on auto until the user explicitly locks it with 'l'.
-    # Auto-locking on a timer was wrong — it would freeze whatever the camera
-    # happened to negotiate in the first 3 seconds, even if the lighting
-    # wasn't representative yet.
-    ae_locked        = False
-    # Ball-spot exposure loop: when 'e' is pressed, iterate ball_exposure_step()
-    # for up to a couple seconds, ~150ms apart so the camera has time to settle.
-    ae_optimize_until      = 0.0
-    ae_optimize_last_step  = 0.0
-    # Transient status message for the HUD (HSV recalibrated, AE locked, etc).
+    # Transient status message for the HUD (HSV recalibrated, etc).
     hsv_status       = ""
     hsv_status_until = 0.0
     cooldown_until   = 0.0     # suppress new reps until this session time
@@ -1209,17 +1196,24 @@ def main():
             capture_t = time.time() - start
 
             # 2. Submit to the worker (HSV mask + morph + best contour).
-            # Pass the last known ball (cx, cy, r) as an anchor — the
-            # worker hard-rejects contours outside the search radius and
-            # gives a proximity bonus to the closest one.  This is what
-            # keeps a tiny distant yellow speck from "winning" over a
-            # partially-occluded ball right where we expect it.
-            anchor = None
-            if (last_seen_pos is not None
-                    and last_known_r is not None
-                    and capture_t - last_seen_at < TRACK_LOST_GAP_S):
-                anchor = (last_seen_pos[0], last_seen_pos[1], last_known_r)
-            cv_worker.submit(capture_frame, frame_idx, capture_t, anchor)
+            # Two layers of position memory:
+            #   - anchor:       strict (within TRACK_LOST_GAP_S) — full
+            #                   size+position lock for tight tracking.
+            #   - ghost_anchor: soft  (within GHOST_ANCHOR_GAP_S)  — last
+            #                   known position only.  Strict gates still
+            #                   apply, but blobs near here get a score
+            #                   bonus so the ball wins over noise when
+            #                   it pops back out of an occluding stick.
+            anchor       = None
+            ghost_anchor = None
+            if last_seen_pos is not None:
+                age = capture_t - last_seen_at
+                if age < TRACK_LOST_GAP_S and last_known_r is not None:
+                    anchor = (last_seen_pos[0], last_seen_pos[1], last_known_r)
+                elif age < GHOST_ANCHOR_GAP_S:
+                    ghost_anchor = (last_seen_pos[0], last_seen_pos[1])
+            cv_worker.submit(capture_frame, frame_idx, capture_t,
+                             anchor, ghost_anchor)
             frame_idx += 1
 
             # 3. Pull the freshest worker result.  None on the first few
@@ -1237,26 +1231,6 @@ def main():
                     fps_window[-1] - fps_window[0], 1e-6)
             else:
                 cur_fps = 0.0
-
-            # Ball-spot exposure convergence loop. Runs only while
-            # ae_optimize_until is in the future, and only when there's
-            # actually a ball to measure.
-            if (now < ae_optimize_until and best is not None
-                    and (now - ae_optimize_last_step) >= 0.15):
-                res = ball_exposure_step(frame, best)
-                ae_optimize_last_step = now
-                if res:
-                    hsv_status = (f"ball V={res['v_ball']:.0f} -> "
-                                  f"expo {res['prev_expo']} -> {res['new_expo']}")
-                    hsv_status_until = now + 2.0
-                    if abs(res['v_ball'] - 200) < 12:
-                        ae_optimize_until = now      # converged
-                        # Also lock WB so colors stay put for HSV detection.
-                        _v4l2_set("/dev/video0",
-                                  white_balance_temperature_auto=0)
-                        ae_locked = True
-                        print(f"[{now:7.2f}s] ball-AE converged + locked: "
-                              f"V={res['v_ball']:.0f}  expo={res['new_expo']}")
 
             # Periodic diagnostic: print main-loop and capture-thread fps.
             if (time.time() - last_fps_print) >= 2.0:
@@ -1415,7 +1389,7 @@ def main():
 
             if hold_active:
                 cv2.putText(frame, "REP confirmed", (8, 26),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7,  
                             (0, 255, 0), 2)
             elif pending_info is not None:
                 cv2.putText(frame, "throwing? waiting for release",
@@ -1477,8 +1451,8 @@ def main():
             cv2.rectangle(frame, (cx_g - b, cy_g - b), (cx_g + b, cy_g + b),
                           (180, 180, 180), 1)
             cv2.putText(frame,
-                        "[h] HSV  [d] reset  [e] expose-ball  [l] lock AE/WB  [u] unlock",
-                        (cx_g - 220, cy_g - b - 6),
+                        "[h] HSV calibrate    [d] reset HSV",
+                        (cx_g - 140, cy_g - b - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
 
             # Transient status banner (HSV updated, AE locked, etc.)
@@ -1537,43 +1511,6 @@ def main():
                     hsv_status = "HSV reset to defaults"
                     hsv_status_until = now + 2.0
                     print(f"[{now:7.2f}s] {hsv_status}")
-                if k == ord('e'):
-                    # Ball-spot exposure: iterate ball_exposure_step()
-                    # for ~2s to converge the camera's exposure on the
-                    # ball's pixels specifically (not the whole scene).
-                    if best is None:
-                        hsv_status = "press 'e' with the ball in view"
-                        hsv_status_until = now + 2.0
-                        print(f"[{now:7.2f}s] {hsv_status}")
-                    elif not _have_v4l2ctl():
-                        print("v4l2-ctl not installed; install with: "
-                              "sudo apt install v4l-utils")
-                    else:
-                        ae_optimize_until     = now + 2.0
-                        ae_optimize_last_step = 0.0
-                        hsv_status = "optimizing exposure for ball..."
-                        hsv_status_until = now + 2.5
-                        print(f"[{now:7.2f}s] {hsv_status}")
-                if k == ord('l'):
-                    # Lock the current auto-converged AE + WB.
-                    locked = lock_exposure_and_wb()
-                    if locked:
-                        ae_locked = True
-                        bits = ", ".join(f"{k_}={v}" for k_, v in locked.items())
-                        hsv_status = f"AE/WB locked: {bits}"
-                        hsv_status_until = now + 3.0
-                        print(f"[{now:7.2f}s] {hsv_status}")
-                    else:
-                        print("v4l2-ctl missing — cannot lock AE/WB")
-                if k == ord('u'):
-                    # Unlock back to auto.
-                    if unlock_exposure_and_wb():
-                        ae_locked = False
-                        hsv_status = "AE/WB back to auto"
-                        hsv_status_until = now + 2.0
-                        print(f"[{now:7.2f}s] {hsv_status}")
-                    else:
-                        print("v4l2-ctl missing — cannot unlock")
     finally:
         elapsed = time.time() - logger.started_at
         avg_cpm = (rep_count * 60.0 / max(elapsed, 1e-3)) if rep_count else 0.0

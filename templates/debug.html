@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="panel">
+  <h2>Controls</h2>
+  <div class="grid cols-2">
+    <div>
+      <div class="muted" style="margin-bottom:8px">Resolution / frame rate</div>
+      <div class="row" id="resBtns"></div>
+    </div>
+    <div>
+      <div class="muted" style="margin-bottom:8px">Wall side</div>
+      <div class="row">
+        <button id="wallLeft" onclick="setWall('left')">&#9664; Left</button>
+        <button id="wallRight" onclick="setWall('right')">Right &#9654;</button>
+      </div>
+    </div>
+  </div>
+  <p class="caption" style="margin-top:10px">Switching resolution briefly reopens the
+    camera (the preview blinks for a second). Both choices are remembered across restarts.</p>
+</div>
+<div class="spacer"></div>
+<div class="summary-cards">
+  <div class="card"><div class="k">CPU</div><div class="v green" id="cpu">--</div><div class="sub">total load</div></div>
+  <div class="card"><div class="k">CPU temp</div><div class="v" id="temp">--</div><div class="sub">hottest core</div></div>
+  <div class="card"><div class="k">RAM</div><div class="v cyan" id="ram">--</div><div class="sub" id="ramsub">--</div></div>
+  <div class="card"><div class="k">Loop FPS</div><div class="v" id="fps">--</div><div class="sub">vision pipeline</div></div>
+  <div class="card"><div class="k">Uptime</div><div class="v" id="uptime">--</div><div class="sub">since boot</div></div>
+</div>
+
+<div class="spacer"></div>
+<div class="grid cols-2">
+  <div class="panel">
+    <h2>CPU cores</h2>
+    <div id="cores"></div>
+  </div>
+  <div class="panel">
+    <h2>System</h2>
+    <table>
+      <tr><td>Camera</td><td id="cam">--</td></tr>
+      <tr><td>Session</td><td id="sess">--</td></tr>
+      <tr><td>Buttons (GPIO)</td><td id="btn">--</td></tr>
+      <tr><td>Load avg</td><td id="load">--</td></tr>
+      <tr><td>CPU freq</td><td id="freq">--</td></tr>
+    </table>
+    <div class="spacer"></div>
+    <h2 style="margin-bottom:8px">Temperatures</h2>
+    <div id="temps" class="muted">--</div>
+  </div>
+</div>
+{% endblock %}
+
+{% block script %}
+<style>
+.corebar { display: flex; align-items: center; gap: 10px; margin: 7px 0; }
+.corebar .lab { width: 32px; color: var(--muted); font-size: 12px; }
+.corebar .track { flex: 1; height: 14px; background: var(--panel2);
+  border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.corebar .fill { height: 100%; background: var(--cyan); transition: width .3s; }
+.corebar .pct { width: 44px; text-align: right; font-size: 12px;
+  font-variant-numeric: tabular-nums; }
+</style>
+<script>
+function coreColor(p) { return p < 70 ? 'var(--cyan)' : p < 90 ? '#f59e0b' : 'var(--orange)'; }
+async function poll() {
+  let d;
+  try { d = await api('/api/debug'); } catch (e) { setNavStatus('debug fetch failed'); return; }
+  const num = (x, dp = 0) => (typeof x === 'number' ? x.toFixed(dp) : '--');
+  document.getElementById('cpu').textContent = num(d.cpu_total) + '%';
+  document.getElementById('temp').textContent = num(d.cpu_temp) + '°';
+  const mem = d.mem || {};
+  document.getElementById('ram').textContent = num(mem.percent) + '%';
+  document.getElementById('ramsub').textContent = (mem.used_mb || 0) + ' / ' + (mem.total_mb || 0) + ' MB';
+  document.getElementById('fps').textContent = num(d.fps);
+  document.getElementById('uptime').textContent = d.uptime || '--';
+
+  const cores = d.cpu_cores || [];
+  document.getElementById('cores').innerHTML = cores.map((c, i) => `
+    <div class="corebar"><span class="lab">C${i}</span>
+      <span class="track"><span class="fill" style="width:${c}%;background:${coreColor(c)}"></span></span>
+      <span class="pct">${c.toFixed(0)}%</span></div>`).join('');
+
+  const cam = d.camera || {};
+  document.getElementById('cam').textContent = cam.ok ? cam.src : 'not open';
+  document.getElementById('sess').textContent = d.session_active ? 'running' : 'idle';
+  const b = d.buttons || {};
+  document.getElementById('btn').textContent = b.gpio ? `on (${b.lines} pins)` : ('off — ' + (b.detail || 'keyboard'));
+  const load = d.load || [0, 0, 0];
+  document.getElementById('load').textContent = load.map(x => x.toFixed(2)).join('   ');
+  document.getElementById('freq').textContent = (d.freqs_mhz || []).map(f => f + ' MHz').join('  ') || '--';
+  const temps = d.temps || {};
+  document.getElementById('temps').innerHTML = Object.entries(temps)
+    .map(([k, v]) => `${k.replace('-thermal', '')}: <b style="color:var(--txt)">${v.toFixed(0)}°</b>`)
+    .join(' &nbsp; ') || '--';
+  if (d.preset) markRes(d.preset);
+  if (d.wall) markWall(d.wall);
+}
+
+function markRes(preset) {
+  document.querySelectorAll('#resBtns button').forEach(b =>
+    b.classList.toggle('primary', b.dataset.pid === preset));
+}
+function markWall(wall) {
+  document.getElementById('wallLeft').classList.toggle('primary', wall === 'left');
+  document.getElementById('wallRight').classList.toggle('primary', wall === 'right');
+}
+async function loadConfig() {
+  const c = await api('/api/config');
+  document.getElementById('resBtns').innerHTML = Object.entries(c.presets).map(
+    ([id, label]) => `<button data-pid="${id}" onclick="setRes('${id}')">${label}</button>`).join('');
+  markRes(c.preset); markWall(c.wall);
+}
+async function setRes(pid) {
+  const r = await postJSON('/api/resolution', { preset: pid });
+  markRes(r.preset);
+  setNavStatus('switching to ' + pid + ' …');
+}
+async function setWall(side) {
+  const r = await postJSON('/api/wall', { side });
+  markWall(r.wall);
+  setNavStatus('wall side: ' + r.wall);
+}
+loadConfig();
+poll();
+setInterval(poll, 1000);
+</script>
+{% endblock %}

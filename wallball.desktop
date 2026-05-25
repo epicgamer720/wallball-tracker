@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Wall Ball
+Comment=Wall-ball tracker (web dashboard + on-screen UI)
+Exec=/home/darsh/wallball-tracker/run_pi.sh
+Terminal=false
+X-GNOME-Autostart-enabled=true

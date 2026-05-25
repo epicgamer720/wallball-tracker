@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Wall Ball
+Comment=Start the wall-ball tracker (web + on-screen UI)
+Exec=/home/darsh/wallball-tracker/run_pi.sh
+Icon=camera-video
+Terminal=false
+Categories=Utility;

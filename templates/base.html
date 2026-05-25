@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wall Ball &middot; {{ active|capitalize }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <header class="nav">
+    <div class="brand">WALL<span>BALL</span></div>
+    <nav class="tabs">
+      <a href="{{ url_for('setup') }}" class="{{ 'on' if active=='setup' else '' }}">Setup</a>
+      <a href="{{ url_for('live') }}" class="{{ 'on' if active=='live' else '' }}">Live</a>
+      <a href="{{ url_for('analytics_page') }}" class="{{ 'on' if active=='analytics' else '' }}">Analytics</a>
+      <a href="{{ url_for('debug_page') }}" class="{{ 'on' if active=='debug' else '' }}">Debug</a>
+    </nav>
+    <div class="navstatus" id="navstatus"></div>
+  </header>
+  <main>{% block content %}{% endblock %}</main>
+  <script>
+    async function api(path, opts) { const r = await fetch(path, opts); return r.json(); }
+    async function postJSON(path, body) {
+      return api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                         body: JSON.stringify(body || {}) });
+    }
+    function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
+    function setNavStatus(msg) {
+      const el = document.getElementById('navstatus');
+      if (el) el.textContent = msg || '';
+    }
+  </script>
+  {% block script %}{% endblock %}
+</body>
+</html>
