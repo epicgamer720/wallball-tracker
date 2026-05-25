@@ -97,6 +97,12 @@ MIN_CIRCULARITY   = 0.40       # LOOSE-mode floor.  A finger across the ball
 # `circ * area` score below, a real ball crushes any plausible noise blob.
 MIN_RADIUS_PX_STRICT    = 22
 MIN_CIRCULARITY_STRICT  = 0.60
+
+# Absolute minimum ball radius (full-res px), enforced in BOTH tracking and
+# re-acquire modes.  Stops the tracker latching onto tiny specks and keeps the
+# anchor from ratcheting down to nothing when it loses the ball.  Set per
+# resolution preset (and tunable live from the Setup tab).
+MIN_BALL_RADIUS_PX      = 12
 TRAIL_MAX_AGE_S   = 1.0
 TRAIL_LEN         = 240        # generous for high-fps cameras
 
@@ -167,6 +173,8 @@ FRAGMENT_RESIDUAL_PX    = 4.0    # median |dist-to-circle| must be <= this
 # ball throws still produce a candidate.  The speed gates below do the real
 # filtering of fake/idle motion.
 MIN_POINTS_FIT    = 7
+MAX_FIT_PTS       = 36       # cap the suffix-window scan — bounds per-frame cost
+                            # at high fps; a wall-ball throw fits well within this
 MIN_DURATION_S    = 0.10
 MIN_TOTAL_DISP_PX = 120
 MIN_A_PX_S2       = 250.0
@@ -494,6 +502,8 @@ class MaskContourWorker:
         # Re-acquire-mode (no anchor) — strict, only ball-shaped wins.
         self.min_radius_px_strict   = min_radius_px_strict
         self.min_circularity_strict = min_circularity_strict
+        # Absolute size floor applied in every mode (tunable at runtime).
+        self.min_ball_radius_px     = MIN_BALL_RADIUS_PX
         self._in_q   = queue.Queue(maxsize=1)
         self._out_q  = queue.Queue(maxsize=1)
         self._stop   = False
@@ -540,6 +550,9 @@ class MaskContourWorker:
             else:
                 min_r  = self.min_radius_px
                 min_c  = self.min_circularity
+            # Absolute floor — never accept a ball smaller than this, in any
+            # mode.  Kills tiny-speck lock-on and anchor ratcheting.
+            min_r = max(min_r, self.min_ball_radius_px)
             min_area = math.pi * min_r * min_r * 0.5
             try:
                 # Run the heavy pixel ops at ~640 wide regardless of capture
@@ -980,6 +993,8 @@ def _check_burst(points, wall_dir):
 def analyse_trajectory(points, wall_dir):
     """Try the parabolic path first (suffix windows, biggest first); fall back
     to the burst detector when no clean parabolic fit exists."""
+    if len(points) > MAX_FIT_PTS:        # only the recent tail matters for a throw
+        points = points[-MAX_FIT_PTS:]
     n = len(points)
     if n < MIN_BURST_POINTS:
         return None

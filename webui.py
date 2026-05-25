@@ -40,11 +40,11 @@ from buttons import ButtonInput
 # (ref radius, hard search radius, max ball radius) change.
 RES_PRESETS = {
     "640x480@120": {"label": "640x480 - 120fps", "w": 640,  "h": 480, "fps": 120,
-                    "ref": 30.0, "hard": 120.0, "maxr": 100, "kopen": 3, "kclose": 7},
+                    "ref": 30.0, "hard": 120.0, "maxr": 100, "minr": 12, "kopen": 3, "kclose": 7},
     "1280x720@60": {"label": "1280x720 - 60fps", "w": 1280, "h": 720, "fps": 60,
-                    "ref": 60.0, "hard": 220.0, "maxr": 220, "kopen": 3, "kclose": 7},
+                    "ref": 60.0, "hard": 220.0, "maxr": 220, "minr": 24, "kopen": 3, "kclose": 7},
     "1280x800@30": {"label": "1280x800 - 30fps", "w": 1280, "h": 800, "fps": 30,
-                    "ref": 60.0, "hard": 220.0, "maxr": 220, "kopen": 3, "kclose": 7},
+                    "ref": 60.0, "hard": 220.0, "maxr": 220, "minr": 24, "kopen": 3, "kclose": 7},
 }
 RUNTIME_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "runtime.json")
@@ -285,7 +285,9 @@ class Engine:
             self.filter_cy.reset()
             self.filter_r.reset()
 
-        if best is not None or self.pending_info is not None:
+        # The trajectory fit only feeds rep counting — skip it entirely when no
+        # session is running (removes heavy main-thread work during setup/idle).
+        if self.session_active and (best is not None or self.pending_info is not None):
             info = wb.analyse_trajectory(list(self.trail), self.wall_dir)
         else:
             info = None
@@ -712,6 +714,8 @@ class Runner:
         # resolution preset + wall side, persisted across restarts
         self.wall_side = wall_side
         self.current_preset = self._detect_preset()
+        self.min_ball = RES_PRESETS[self.current_preset]["minr"]
+        self.engine.cv_worker.min_ball_radius_px = self.min_ball
         self._pending_preset = None
         self._load_runtime()
         # optional on-screen UI on the Pi's monitor + 3-button input
@@ -745,8 +749,11 @@ class Runner:
         wb.FRAME_W, wb.FRAME_H, wb.TARGET_FPS = p["w"], p["h"], p["fps"]
         wb.REF_RADIUS_PX, wb.TRACK_HARD_PX = p["ref"], p["hard"]
         wb.MAX_RADIUS_PX = p["maxr"]
+        wb.MIN_BALL_RADIUS_PX = p["minr"]
+        self.min_ball = p["minr"]
         self.engine.frame_w, self.engine.frame_h = p["w"], p["h"]
         self.engine.cv_worker.max_radius_px = p["maxr"]
+        self.engine.cv_worker.min_ball_radius_px = p["minr"]
         self.engine.cv_worker.kernel_open = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (p["kopen"], p["kopen"]))
         self.engine.cv_worker.kernel_close = cv2.getStructuringElement(
@@ -764,11 +771,15 @@ class Runner:
         if d.get("wall") in ("left", "right"):
             self.wall_side = d["wall"]
             self.engine.set_wall(d["wall"])
+        if isinstance(d.get("min_ball"), (int, float)):
+            self.min_ball = int(d["min_ball"])
+            self.engine.cv_worker.min_ball_radius_px = self.min_ball
 
     def _save_runtime(self):
         try:
             with open(RUNTIME_PATH, "w") as f:
-                json.dump({"preset": self.current_preset, "wall": self.wall_side}, f)
+                json.dump({"preset": self.current_preset, "wall": self.wall_side,
+                           "min_ball": self.min_ball}, f)
         except Exception:
             pass
 
@@ -785,6 +796,13 @@ class Runner:
         self.wall_side = self.engine.wall_side
         self._save_runtime()
 
+    def set_min_ball(self, px):
+        self.min_ball = max(0, int(px))
+        self.engine.cv_worker.min_ball_radius_px = self.min_ball
+        wb.MIN_BALL_RADIUS_PX = self.min_ball
+        self.engine._flash(f"min ball size: {self.min_ball}px")
+        self._save_runtime()
+
     def _do_apply_preset(self, pid):
         """Run in the loop thread: reopen the camera at the new resolution."""
         try:
@@ -799,6 +817,7 @@ class Runner:
         self._last_annotated = None
         self._last_mask = None
         self._open()
+        self._save_runtime()
         print(f"[preset] {pid} -> {self.src}", flush=True)
 
     def _open(self):
@@ -1033,8 +1052,16 @@ def api_config():
     return jsonify({
         "preset": runner.current_preset,
         "wall": runner.wall_side,
+        "min_ball": runner.min_ball,
         "presets": {k: v["label"] for k, v in RES_PRESETS.items()},
     })
+
+
+@app.route("/api/minball", methods=["POST"])
+def api_minball():
+    px = (request.get_json(silent=True) or {}).get("px", 0)
+    runner.set_min_ball(px)
+    return jsonify({"ok": True, "min_ball": runner.min_ball})
 
 
 @app.route("/api/resolution", methods=["POST"])

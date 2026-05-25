@@ -32,6 +32,17 @@
     </div>
 
     <div class="spacer"></div>
+    <h2>Detection</h2>
+    <div class="slider">
+      <label>Minimum ball size <b id="minBallVal">--</b> px</label>
+      <input type="range" id="minBall" min="0" max="80" value="12"
+             oninput="minBallVal.textContent=this.value"
+             onchange="postJSON('/api/minball',{px:+this.value})">
+    </div>
+    <p class="caption">Ignore detections smaller than this — raise it if tracking
+      jumps to tiny specks when it loses the ball.</p>
+
+    <div class="spacer"></div>
     <h2>Camera exposure &amp; white balance</h2>
     <div class="switchrow">
       <span>Auto-exposure</span>
@@ -175,6 +186,9 @@ async function poll() {
 (async function init() {
   buildHSV();
   applyHSV(await api('/api/hsv'));
+  const cfg = await api('/api/config');
+  document.getElementById('minBall').value = cfg.min_ball;
+  document.getElementById('minBallVal').textContent = cfg.min_ball;
   poll();
   setInterval(poll, 800);
 })();
