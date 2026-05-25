@@ -35,13 +35,16 @@ from buttons import ButtonInput
 
 # Resolution / frame-rate presets. Each bundles the resolution-tied tuning so
 # a switch stays consistent (ref radius, hard search radius, morph kernels).
+# Detection runs at ~640 wide internally, so morph kernels stay 3/7 for every
+# preset; only the camera resolution/fps and the full-res geometry thresholds
+# (ref radius, hard search radius, max ball radius) change.
 RES_PRESETS = {
     "640x480@120": {"label": "640x480 - 120fps", "w": 640,  "h": 480, "fps": 120,
-                    "ref": 30.0, "hard": 120.0, "kopen": 3, "kclose": 7},
+                    "ref": 30.0, "hard": 120.0, "maxr": 100, "kopen": 3, "kclose": 7},
     "1280x720@60": {"label": "1280x720 - 60fps", "w": 1280, "h": 720, "fps": 60,
-                    "ref": 60.0, "hard": 220.0, "kopen": 5, "kclose": 11},
+                    "ref": 60.0, "hard": 220.0, "maxr": 220, "kopen": 3, "kclose": 7},
     "1280x800@30": {"label": "1280x800 - 30fps", "w": 1280, "h": 800, "fps": 30,
-                    "ref": 60.0, "hard": 220.0, "kopen": 5, "kclose": 11},
+                    "ref": 60.0, "hard": 220.0, "maxr": 220, "kopen": 3, "kclose": 7},
 }
 RUNTIME_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "runtime.json")
@@ -741,7 +744,9 @@ class Runner:
             return
         wb.FRAME_W, wb.FRAME_H, wb.TARGET_FPS = p["w"], p["h"], p["fps"]
         wb.REF_RADIUS_PX, wb.TRACK_HARD_PX = p["ref"], p["hard"]
+        wb.MAX_RADIUS_PX = p["maxr"]
         self.engine.frame_w, self.engine.frame_h = p["w"], p["h"]
+        self.engine.cv_worker.max_radius_px = p["maxr"]
         self.engine.cv_worker.kernel_open = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (p["kopen"], p["kopen"]))
         self.engine.cv_worker.kernel_close = cv2.getStructuringElement(

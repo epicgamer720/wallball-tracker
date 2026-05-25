@@ -542,23 +542,32 @@ class MaskContourWorker:
                 min_c  = self.min_circularity
             min_area = math.pi * min_r * min_r * 0.5
             try:
+                # Run the heavy pixel ops at ~640 wide regardless of capture
+                # resolution, then scale the contours back to full res.  This
+                # keeps detection cost ~constant (so 1280x720 stays fast) while
+                # the display frame stays full-resolution and sharp.
+                fh, fw = frame.shape[:2]
+                ms = 640.0 / fw if fw > 640 else 1.0
+                src = (cv2.resize(frame, (int(fw * ms), int(fh * ms)),
+                                  interpolation=cv2.INTER_LINEAR)
+                       if ms < 1.0 else frame)
                 # --- HSV mask (reads module-level bounds; updated by 'h'). ---
-                # Stronger input blur smooths sensor noise before it can
-                # become mask noise.
-                blurred = cv2.GaussianBlur(frame, (7, 7), 0)
+                blurred = cv2.GaussianBlur(src, (5, 5), 0)
                 hsv  = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
                 mask_a = cv2.inRange(hsv, HSV_LOW_A, HSV_HIGH_A)
                 mask_b = cv2.inRange(hsv, HSV_LOW_B, HSV_HIGH_B)
                 mask = cv2.bitwise_or(mask_a, mask_b)
-                # Median blur kills isolated speckle pixels that morphology
-                # struggles with.  Cheap at small kernel sizes.
                 mask = cv2.medianBlur(mask, 5)
                 mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  self.kernel_open)
                 mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel_close)
 
-                # --- Best ball-shaped contour. -------------------------------
+                # --- Best ball-shaped contour (scaled back to full res). -----
                 contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                                cv2.CHAIN_APPROX_SIMPLE)
+                if ms < 1.0 and contours:
+                    inv = 1.0 / ms
+                    contours = [np.round(c.astype(np.float32) * inv).astype(np.int32)
+                                for c in contours]
                 best, best_score = None, 0.0
                 for c in contours:
                     area = cv2.contourArea(c)
@@ -709,13 +718,68 @@ class ThreadedCapture:
         self._thread.join(timeout=1.0)
 
 
+def _try_open_gstreamer(w, h, target_fps):
+    """GStreamer pipeline with hardware MJPEG decode (Rockchip MPP).
+    Offloads MJPEG->BGR off the CPU, freeing cores for detection — this is
+    what makes 1280x720@60 possible. Returns (cap, label) or (None, err)."""
+    if not sys.platform.startswith("linux"):
+        return None, "not linux"
+    import subprocess
+    decoder = None
+    for el in ("mppjpegdec", "v4l2jpegdec", "jpegdec"):
+        try:
+            res = subprocess.run(["gst-inspect-1.0", el],
+                                 capture_output=True, timeout=2, text=True)
+            if res.returncode == 0 and res.stdout.strip():
+                decoder = el
+                break
+        except Exception:
+            continue
+    if decoder is None:
+        return None, "no jpeg decoder element found"
+    pipeline = (
+        f"v4l2src device=/dev/video0 io-mode=4 ! "
+        f"image/jpeg,width={w},height={h},framerate={target_fps}/1 ! "
+        f"{decoder} ! videoconvert n-threads=4 ! "
+        f"video/x-raw,format=BGR ! "
+        f"appsink drop=true sync=false max-buffers=1"
+    )
+    cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+    if not cap.isOpened():
+        return None, f"pipeline failed to open ({decoder})"
+    time.sleep(0.5)
+    for _ in range(10):
+        ok, _f = cap.read()
+        if ok:
+            return cap, f"GST:{decoder}"
+        time.sleep(0.1)
+    cap.release()
+    return None, f"pipeline opened but no frames ({decoder})"
+
+
 def open_camera(w, h, return_cap=False):
     """Plain V4L2 / DSHOW / MSMF camera open.  No GStreamer, no exposure
     twiddling — the camera's own auto-exposure / auto-WB stays on.
 
     return_cap=True also returns the underlying cv2.VideoCapture as a 4th
-    element so callers (e.g. the web UI) can drive exposure / white-balance
-    controls.  Default stays a 3-tuple so existing callers are unaffected."""
+    element.  Prefers GStreamer hardware MJPEG decode (Rockchip mppjpegdec)
+    on Linux for high fps; falls back to direct V4L2 (CPU decode)."""
+    # 1) GStreamer hardware-decode path (Linux) — the high-fps route.
+    gcap, glabel = _try_open_gstreamer(w, h, TARGET_FPS)
+    if gcap is not None:
+        def gread():
+            for _ in range(3):
+                ok, fr = gcap.read()
+                if ok:
+                    return True, fr
+                time.sleep(0.005)
+            return False, None
+        print(f"camera: {glabel} {w}x{h}@{TARGET_FPS}", flush=True)
+        if return_cap:
+            return gread, gcap.release, glabel, gcap
+        return gread, gcap.release, glabel
+
+    # 2) Direct V4L2 / DSHOW / MSMF fallback (CPU MJPEG decode).
     backends = [("DSHOW", cv2.CAP_DSHOW), ("MSMF", cv2.CAP_MSMF),
                 ("ANY",   cv2.CAP_ANY)] \
         if sys.platform.startswith("win") else \
