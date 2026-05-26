@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="panel">
+  <div class="row spread">
+    <h2 style="margin:0">Choose a session</h2>
+    <select id="picker" onchange="loadSession(this.value)"></select>
+  </div>
+  <div class="spacer"></div>
+  <p class="headline" id="headline">Pick a session to see how it went.</p>
+  <div class="spacer"></div>
+  <div class="summary-cards">
+    <div class="card"><div class="k">Reps</div><div class="v green" id="sReps">--</div>
+      <div class="sub">throws counted</div></div>
+    <div class="card"><div class="k">Drops</div><div class="v orange" id="sDrops">--</div>
+      <div class="sub">ball lost / hit floor</div></div>
+    <div class="card"><div class="k">Length</div><div class="v" id="sDur">--</div>
+      <div class="sub">session duration</div></div>
+    <div class="card"><div class="k">Pace</div><div class="v cyan" id="sCpm">--</div>
+      <div class="sub">throws per minute</div></div>
+    <div class="card"><div class="k">Steadiness</div><div class="v" id="sCons">--</div>
+      <div class="sub">100% = perfectly even rhythm</div></div>
+  </div>
+</div>
+
+<div class="spacer"></div>
+<div class="grid cols-2">
+  <div class="panel">
+    <h2>Reps over time</h2>
+    <p class="caption">Each step up is one counted rep. Long flat stretches are pauses or drops.</p>
+    <div class="chartbox"><canvas id="cReps"></canvas></div>
+  </div>
+  <div class="panel">
+    <h2>Throwing pace</h2>
+    <p class="caption">Throws per minute through the session (smoothed). Red &times; marks a drop.
+      A steady decline often means fatigue.</p>
+    <div class="chartbox"><canvas id="cCad"></canvas></div>
+  </div>
+</div>
+
+<div class="spacer"></div>
+<div class="panel">
+  <h2>Throw power <span class="hint">— per rep</span></h2>
+  <p class="caption">How fast each throw was (camera pixels/sec — taller bars = harder/faster throws).
+    Short bars among tall ones are soft or mis-detected reps.</p>
+  <div class="chartbox short"><canvas id="cSpeed"></canvas></div>
+</div>
+
+<div class="spacer"></div>
+<div class="panel">
+  <h2>Progress over sessions</h2>
+  <p class="caption">Each bar is one past session's reps; the line is its average pace.
+    Both trending up over time = you're improving. Tap a row to open that session.</p>
+  <div class="chartbox"><canvas id="cHist"></canvas></div>
+  <div class="spacer"></div>
+  <div class="tablewrap">
+    <table id="histTable">
+      <thead><tr><th>Date</th><th>Reps</th><th>Drops</th><th>Pace /min</th>
+        <th>Steadiness</th><th>Length</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block script %}
+<script>
+const charts = {};
+function draw(id, cfg) { if (charts[id]) charts[id].destroy(); charts[id] = new Chart(document.getElementById(id), cfg); }
+const AX = c => ({ ticks: { color: '#8b90a4' }, grid: { color: '#222633' }, ...(c || {}) });
+const NOLEG = { legend: { display: false } };
+function fmtDur(s) { const m = Math.floor(s / 60); return m ? `${m}m ${Math.round(s % 60)}s` : `${Math.round(s)}s`; }
+
+async function loadSession(id) {
+  if (!id) return;
+  const d = await api('/api/session/' + id);
+  const su = d.summary, cons = d.stats.consistency_pct;
+  document.getElementById('sReps').textContent = su.reps;
+  document.getElementById('sDrops').textContent = su.drops;
+  document.getElementById('sDur').textContent = fmtDur(su.duration_s);
+  document.getElementById('sCpm').textContent = su.avg_cpm.toFixed(0);
+  document.getElementById('sCons').textContent = cons == null ? '--' : cons + '%';
+
+  // plain-language headline
+  let h = `<b>${su.reps} reps</b> in <b>${fmtDur(su.duration_s)}</b> ` +
+          `&mdash; about <b>${su.avg_cpm.toFixed(0)} throws/min</b>, ` +
+          `<b>${su.drops}</b> drop${su.drops === 1 ? '' : 's'}.`;
+  if (cons != null) {
+    const word = cons >= 75 ? 'very steady' : cons >= 50 ? 'fairly steady' : 'uneven';
+    h += ` Rhythm was <b>${word}</b> (${cons}%).`;
+  }
+  document.getElementById('headline').innerHTML = h;
+
+  // 1) reps over time (stepped)
+  const reps = d.series.cumulative_reps.map(p => ({ x: p.t, y: p.reps }));
+  draw('cReps', {
+    type: 'line',
+    data: { datasets: [{ data: reps, borderColor: '#4ade80', stepped: true,
+      pointRadius: 0, borderWidth: 2, fill: false }] },
+    options: { animation: false, plugins: NOLEG,
+      scales: { x: AX({ type: 'linear', title: { display: true, text: 'seconds into session', color: '#8b90a4' } }),
+                y: AX({ beginAtZero: true, title: { display: true, text: 'total reps', color: '#8b90a4' } }) } }
+  });
+
+  // 2) throwing pace — one smoothed line + drop markers
+  const pace = d.series.cadence_rolling.map(p => ({ x: p.t, y: p.cpm }));
+  const drops = d.drops.map(x => ({ x: x.t, y: 0 }));
+  draw('cCad', {
+    data: { datasets: [
+      { type: 'line', label: 'throws / min', data: pace, borderColor: '#22d3ee',
+        backgroundColor: 'rgba(34,211,238,.14)', fill: true, tension: .35,
+        pointRadius: 0, borderWidth: 2 },
+      { type: 'scatter', label: 'drop', data: drops, pointStyle: 'crossRot',
+        pointRadius: 8, borderWidth: 2, borderColor: '#fb7185', backgroundColor: '#fb7185' } ] },
+    options: { animation: false, plugins: { legend: { labels: { color: '#8b90a4', usePointStyle: true } } },
+      scales: { x: AX({ type: 'linear', title: { display: true, text: 'seconds into session', color: '#8b90a4' } }),
+                y: AX({ beginAtZero: true, title: { display: true, text: 'throws / min', color: '#8b90a4' } }) } }
+  });
+
+  // 3) throw power per rep
+  draw('cSpeed', {
+    type: 'bar',
+    data: { labels: d.series.peak_speed.map(x => x.rep),
+      datasets: [{ data: d.series.peak_speed.map(x => x.v), backgroundColor: '#6366f1' }] },
+    options: { animation: false, plugins: NOLEG,
+      scales: { x: AX({ title: { display: true, text: 'rep number', color: '#8b90a4' } }),
+                y: AX({ beginAtZero: true, title: { display: true, text: 'speed (px/s)', color: '#8b90a4' } }) } }
+  });
+}
+
+async function loadHistory(preselect) {
+  const hist = await api('/api/sessions');            // newest first
+  const picker = document.getElementById('picker');
+  picker.innerHTML = hist.map(s =>
+    `<option value="${s.id}">${s.date_label} — ${s.reps} reps</option>`).join('');
+
+  const tbody = document.querySelector('#histTable tbody');
+  tbody.innerHTML = hist.map(s => `
+    <tr class="clickable" onclick="picker.value='${s.id}';loadSession('${s.id}')">
+      <td>${s.date_label}</td><td>${s.reps}</td><td>${s.drops}</td>
+      <td>${s.avg_cpm.toFixed(0)}</td>
+      <td>${s.consistency_pct == null ? '--' : s.consistency_pct + '%'}</td>
+      <td>${fmtDur(s.duration_s)}</td></tr>`).join('');
+
+  const asc = [...hist].reverse().filter(s => s.reps > 0);
+  draw('cHist', {
+    data: { labels: asc.map(s => s.date_label),
+      datasets: [
+        { type: 'bar', label: 'reps', data: asc.map(s => s.reps),
+          backgroundColor: '#4ade80', yAxisID: 'y' },
+        { type: 'line', label: 'avg pace /min', data: asc.map(s => s.avg_cpm),
+          borderColor: '#22d3ee', tension: .3, borderWidth: 2, pointRadius: 3, yAxisID: 'y1' } ] },
+    options: { animation: false, plugins: { legend: { labels: { color: '#8b90a4' } } },
+      scales: { x: AX({ ticks: { color: '#8b90a4', maxTicksLimit: 8 } }),
+                y: AX({ position: 'left', beginAtZero: true, title: { display: true, text: 'reps', color: '#8b90a4' } }),
+                y1: AX({ position: 'right', beginAtZero: true, grid: { drawOnChartArea: false },
+                         title: { display: true, text: 'pace /min', color: '#8b90a4' } }) } }
+  });
+
+  const sel = preselect && hist.some(s => s.id === preselect) ? preselect : (hist[0] && hist[0].id);
+  if (sel) { picker.value = sel; loadSession(sel); }
+  else document.getElementById('headline').textContent = 'No sessions yet — run one from the Live tab.';
+}
+
+(function init() {
+  loadHistory(new URLSearchParams(location.search).get('session'));
+})();
+</script>
+{% endblock %}

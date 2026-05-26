@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block content %}
+<div id="nosession" class="banner" style="display:none">
+  No session running. Go to <a href="{{ url_for('setup') }}">Setup</a> to calibrate and start one.
+</div>
+
+<div class="grid cols-2" id="livegrid">
+  <div class="panel">
+    <div class="videowrap"><img id="stream" src="{{ url_for('stream_video') }}" alt="live"></div>
+    <div class="row spread" style="margin-top:14px">
+      <span class="statepill" id="state">--</span>
+      <span class="muted">elapsed <b id="elapsed">0s</b> &middot; <b id="fps">0</b> fps</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="cards">
+      <div class="card big" style="grid-column:1 / -1">
+        <div class="k">Reps</div><div class="v green" id="reps">0</div>
+      </div>
+      <div class="card"><div class="k">Cadence</div><div class="v cyan"><span id="cpm">0</span><small style="font-size:14px"> /min</small></div></div>
+      <div class="card"><div class="k">Drops</div><div class="v orange" id="drops">0</div></div>
+      <div class="card"><div class="k">Last rep</div><div class="v" id="lastrep">--</div></div>
+    </div>
+
+    <div class="spacer"></div>
+    <h2>Cadence (live)</h2>
+    <div class="chartbox short"><canvas id="cadChart"></canvas></div>
+
+    <div class="spacer"></div>
+    <div class="row">
+      <button class="danger" onclick="stopSession()">Stop &amp; save &rarr;</button>
+      <button onclick="postJSON('/api/session/reset')">Reset counts</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block script %}
+<script>
+let cad;
+function initChart() {
+  cad = new Chart(document.getElementById('cadChart'), {
+    type: 'line',
+    data: { labels: [], datasets: [{
+      label: 'cpm', data: [], borderColor: '#22d3ee',
+      backgroundColor: 'rgba(34,211,238,.15)', fill: true, tension: .3,
+      pointRadius: 0, borderWidth: 2 }] },
+    options: { animation: false, plugins: { legend: { display: false } },
+      scales: { x: { ticks: { color: '#8b90a4', maxTicksLimit: 6 }, grid: { color: '#222633' } },
+                y: { beginAtZero: true, ticks: { color: '#8b90a4' }, grid: { color: '#222633' } } } }
+  });
+}
+const MAXPTS = 80;
+function pushCad(t, cpm) {
+  cad.data.labels.push(t.toFixed(0) + 's');
+  cad.data.datasets[0].data.push(cpm);
+  if (cad.data.labels.length > MAXPTS) { cad.data.labels.shift(); cad.data.datasets[0].data.shift(); }
+  cad.update('none');
+}
+async function stopSession() {
+  const r = await postJSON('/api/session/stop');
+  const id = r.summary && r.summary.id;
+  window.location = '/analytics' + (id ? ('?session=' + id) : '');
+}
+async function poll() {
+  const s = await api('/api/stats');
+  document.getElementById('nosession').style.display = s.session_active ? 'none' : 'block';
+  document.getElementById('livegrid').style.opacity = s.session_active ? 1 : .45;
+  document.getElementById('reps').textContent = s.reps;
+  document.getElementById('cpm').textContent = s.cpm.toFixed(0);
+  document.getElementById('drops').textContent = s.drops;
+  document.getElementById('fps').textContent = s.fps.toFixed(0);
+  document.getElementById('elapsed').textContent = s.elapsed_s.toFixed(0) + 's';
+  const st = document.getElementById('state');
+  st.textContent = s.state; st.className = 'statepill ' + s.state;
+  if (s.status) setNavStatus(s.status);
+  if (s.session_active) pushCad(s.elapsed_s, s.cpm);
+}
+(function init() {
+  initChart();
+  poll();
+  setInterval(poll, 500);
+})();
+</script>
+{% endblock %}

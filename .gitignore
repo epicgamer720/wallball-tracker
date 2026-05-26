@@ -15,6 +15,14 @@ shot_*.png
 # Claude Code local state
 .claude/
 
+# Per-device runtime state (resolution/wall choice, HSV calibration, logs)
+runtime.json
+hsv_calibration.json
+wallball.log
+
+# Conversation/session export (not project code)
+session-export-*/
+
 # OS / editor
 .DS_Store
 Thumbs.db

@@ -1,0 +1,196 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="grid cols-2">
+  <div class="panel">
+    <div class="viewtabs row">
+      <button id="tabVideo" class="on" onclick="showView('video')">Camera</button>
+      <button id="tabMask" onclick="showView('mask')">Mask</button>
+      <span class="muted" id="detect" style="margin-left:auto"></span>
+    </div>
+    <div class="videowrap">
+      <img id="stream" src="{{ url_for('stream_video') }}" alt="camera">
+    </div>
+    <p class="muted" style="margin-top:10px">
+      Point the camera at the ball and hit <b>Sample detected ball</b>, or drag the
+      sliders and watch the <b>Mask</b> view — the ball should be solid white,
+      everything else black.
+    </p>
+  </div>
+
+  <div class="panel">
+    <h2>Colour (HSV)</h2>
+    <div id="hsv"></div>
+    <div class="swatch">
+      <span class="chip" id="swatch"></span>
+      <span class="lab">approx. selected colour</span>
+    </div>
+    <div class="spacer"></div>
+    <div class="row">
+      <button class="primary" onclick="sampleHSV('ball')">Sample detected ball</button>
+      <button onclick="sampleHSV('box')">Sample centre box</button>
+      <button onclick="resetHSV()">Reset</button>
+    </div>
+
+    <div class="spacer"></div>
+    <h2>Detection</h2>
+    <div class="slider">
+      <label>Minimum ball size <b id="minBallVal">--</b> px</label>
+      <input type="range" id="minBall" min="0" max="80" value="12"
+             oninput="minBallVal.textContent=this.value"
+             onchange="postJSON('/api/minball',{px:+this.value})">
+    </div>
+    <p class="caption">Ignore detections smaller than this — raise it if tracking
+      jumps to tiny specks when it loses the ball.</p>
+
+    <div class="spacer"></div>
+    <h2>Camera exposure &amp; white balance</h2>
+    <div class="switchrow">
+      <span>Auto-exposure</span>
+      <label class="switch"><input type="checkbox" id="autoExp" checked
+        onchange="onAuto('exp', this.checked)"><span class="sl"></span></label>
+    </div>
+    <div class="slider" id="expWrap">
+      <label>Exposure <b id="expVal">--</b></label>
+      <input type="range" id="exp" min="1" max="2500" value="300"
+             oninput="expVal.textContent=this.value"
+             onchange="postJSON('/api/camera',{exposure:+this.value})">
+    </div>
+    <div class="switchrow">
+      <span>Auto white-balance</span>
+      <label class="switch"><input type="checkbox" id="autoWB" checked
+        onchange="onAuto('wb', this.checked)"><span class="sl"></span></label>
+    </div>
+    <div class="slider" id="wbWrap">
+      <label>WB temperature <b id="wbVal">--</b></label>
+      <input type="range" id="wb" min="2000" max="8000" step="100" value="4600"
+             oninput="wbVal.textContent=this.value"
+             onchange="postJSON('/api/camera',{wb:+this.value})">
+    </div>
+
+    <div class="spacer"></div>
+    <button class="primary wide" onclick="startSession()">Start session &rarr;</button>
+  </div>
+</div>
+{% endblock %}
+
+{% block script %}
+<script>
+// [label, min, max, isHue]
+const CH = [['Hue', 0, 179, true], ['Saturation', 0, 255, false], ['Value (brightness)', 0, 255, false]];
+
+function hsv2rgb(H, S, V) {
+  const h = (H / 179) * 360, s = S / 255, v = V / 255;
+  const c = v * s, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m = v - c;
+  let r, g, b;
+  if (h < 60) [r, g, b] = [c, x, 0]; else if (h < 120) [r, g, b] = [x, c, 0];
+  else if (h < 180) [r, g, b] = [0, c, x]; else if (h < 240) [r, g, b] = [0, x, c];
+  else if (h < 300) [r, g, b] = [x, 0, c]; else [r, g, b] = [c, 0, x];
+  return `rgb(${Math.round((r + m) * 255)},${Math.round((g + m) * 255)},${Math.round((b + m) * 255)})`;
+}
+
+function buildHSV() {
+  document.getElementById('hsv').innerHTML = CH.map((c, i) => `
+    <div class="chan-head"><span>${c[0]}</span>
+      <b><span id="lo${i}">?</span> &ndash; <span id="hi${i}">?</span></b></div>
+    <div class="dual ${c[3] ? 'hue' : ''}">
+      <div class="track"><span class="dimL" id="dimL${i}"></span><span class="dimR" id="dimR${i}"></span></div>
+      <input type="range" class="lo" id="rlo${i}" min="${c[1]}" max="${c[2]}" oninput="onSlide(${i},'lo')">
+      <input type="range" class="hi" id="rhi${i}" min="${c[1]}" max="${c[2]}" oninput="onSlide(${i},'hi')">
+    </div>`).join('');
+}
+
+function vals(i) { return [+document.getElementById('rlo' + i).value, +document.getElementById('rhi' + i).value]; }
+
+function refresh(i) {
+  const c = CH[i], span = c[2] - c[1];
+  let [lo, hi] = vals(i);
+  document.getElementById('lo' + i).textContent = lo;
+  document.getElementById('hi' + i).textContent = hi;
+  document.getElementById('dimL' + i).style.width = (100 * (lo - c[1]) / span) + '%';
+  document.getElementById('dimR' + i).style.width = (100 * (c[2] - hi) / span) + '%';
+  // swatch from the middle of each selected range
+  const mid = i => { const [a, b] = vals(i); return (a + b) / 2; };
+  document.getElementById('swatch').style.background = hsv2rgb(mid(0), mid(1), mid(2));
+}
+
+const pushHSV = debounce(() => {
+  postJSON('/api/hsv', { low: [vals(0)[0], vals(1)[0], vals(2)[0]],
+                         high: [vals(0)[1], vals(1)[1], vals(2)[1]] });
+}, 150);
+
+function onSlide(i, which) {
+  let [lo, hi] = vals(i);
+  if (lo > hi) {                       // keep thumbs from crossing
+    if (which === 'lo') document.getElementById('rlo' + i).value = hi;
+    else document.getElementById('rhi' + i).value = lo;
+  }
+  refresh(i);
+  pushHSV();
+}
+
+function applyHSV(b) {
+  for (let i = 0; i < 3; i++) {
+    document.getElementById('rlo' + i).value = b.low[i];
+    document.getElementById('rhi' + i).value = b.high[i];
+    refresh(i);
+  }
+}
+
+async function sampleHSV(source) {
+  const r = await postJSON('/api/hsv/sample', { source });
+  if (!r.ok) { setNavStatus(r.msg); return; }
+  applyHSV({ low: r.low, high: r.high });
+  setNavStatus('HSV sampled from ' + (source === 'ball' ? 'detected ball' : 'centre box'));
+}
+async function resetHSV() { applyHSV(await postJSON('/api/hsv/reset')); setNavStatus('HSV reset'); }
+
+function onAuto(which, isAuto) {
+  document.getElementById((which === 'exp' ? 'exp' : 'wb') + 'Wrap')
+    .classList.toggle('dim', isAuto);
+  postJSON('/api/camera', which === 'exp' ? { auto_exposure: isAuto } : { auto_wb: isAuto });
+}
+
+function showView(which) {
+  document.getElementById('stream').src = which === 'mask' ? '/stream/mask' : '/stream/video';
+  document.getElementById('tabVideo').classList.toggle('on', which === 'video');
+  document.getElementById('tabMask').classList.toggle('on', which === 'mask');
+}
+async function startSession() { await postJSON('/api/session/start'); window.location = '/live'; }
+
+let camInit = false;
+async function poll() {
+  const s = await api('/api/stats');
+  const d = document.getElementById('detect');
+  if (s.ball && s.ball.fresh) d.innerHTML = `&#9679; ball r=${s.ball.r.toFixed(0)}px`;
+  else d.textContent = 'no ball';
+  if (s.status) setNavStatus(s.status);
+  if (!camInit && s.camera && s.camera.ok) {
+    camInit = true;
+    const exp = document.getElementById('exp');
+    if (!s.camera.is_linux) { exp.min = -13; exp.max = -1; exp.value = -6; }
+    if (typeof s.camera.exposure === 'number' && s.camera.exposure) {
+      exp.value = s.camera.exposure; document.getElementById('expVal').textContent = Math.round(s.camera.exposure);
+    }
+    if (typeof s.camera.wb === 'number' && s.camera.wb > 0) {
+      document.getElementById('wb').value = s.camera.wb;
+      document.getElementById('wbVal').textContent = Math.round(s.camera.wb);
+    }
+    // reflect the camera's actual auto state (manual = 1 on V4L2 / 0.25 on DSHOW)
+    const ae = s.camera.auto_exposure, awb = s.camera.auto_wb;
+    document.getElementById('autoExp').checked = (ae !== 1 && ae !== 0.25);
+    document.getElementById('autoWB').checked = (awb !== 0);
+    document.getElementById('expWrap').classList.toggle('dim', document.getElementById('autoExp').checked);
+    document.getElementById('wbWrap').classList.toggle('dim', document.getElementById('autoWB').checked);
+  }
+}
+(async function init() {
+  buildHSV();
+  applyHSV(await api('/api/hsv'));
+  const cfg = await api('/api/config');
+  document.getElementById('minBall').value = cfg.min_ball;
+  document.getElementById('minBallVal').textContent = cfg.min_ball;
+  poll();
+  setInterval(poll, 800);
+})();
+</script>
+{% endblock %}
