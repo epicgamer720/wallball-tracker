@@ -205,10 +205,16 @@ MIN_R2_X          = 0.55       # was 0.80
 REF_RADIUS_PX     = 30.0       # tuned for 640x480 frame size above
 MIN_SCALE         = 0.3
 
-# Speed gates — *tightened* to cut slow-arm false positives. Real throws
-# blow past these; idle gestures don't.
-MIN_PEAK_SPEED_PX  = 500.0      # was 300
-MIN_OUTBOUND_VX_PX = 250.0      # was 100
+# Speed gates — real throws blow past these; carrying/idle gestures don't.
+# Field data (2026-05-31): real throws peak >1500 px/s (typically 2500-5500);
+# a ball *carried* toward the wall peaked <700.  The gate scales with ball
+# size, but MIN_SCALE=0.3 dropped it to ~150 for small/distant balls and let
+# slow carries through (then SUST/burst confirmed them).  So peak speed now
+# also has an absolute floor (MIN_PEAK_SPEED_FLOOR_PX) that scaling can't drop
+# below.  Lower the floor to count soft tosses; raise it if carries still log.
+MIN_PEAK_SPEED_PX       = 900.0     # was 500; scaled by ball size
+MIN_PEAK_SPEED_FLOOR_PX = 800.0     # absolute floor on peak speed, any ball size
+MIN_OUTBOUND_VX_PX      = 250.0     # was 100
 
 # Burst detector — for lacrosse-stick throws, where the ball is only briefly
 # visible mid-flight (it lives in the stick's netting otherwise). Fires
@@ -216,7 +222,8 @@ MIN_OUTBOUND_VX_PX = 250.0      # was 100
 MIN_BURST_POINTS        = 3      # was 4 — catch very brief lacrosse releases
 MIN_BURST_DURATION_S    = 0.03
 MIN_BURST_DX_PX         = 80     # at REF_RADIUS_PX; scaled by ball size
-MIN_BURST_SPEED_PX      = 700.0  # at REF_RADIUS_PX; scaled by ball size
+MIN_BURST_SPEED_PX      = 1200.0 # was 700; real bursts peak >3000. Also floored
+                                 # by MIN_PEAK_SPEED_FLOOR_PX (see speed gates).
 MIN_OUTBOUND_FRAC       = 0.7    # frame-to-frame x deltas must mostly point at wall
 
 # After a rep is counted, suppress new confirmations for this long. Prevents
@@ -981,7 +988,7 @@ def _fit_window(window, wall_dir):
     scale = max(r_med / REF_RADIUS_PX, MIN_SCALE)
     eff_disp  = MIN_TOTAL_DISP_PX     * scale
     eff_a     = MIN_A_PX_S2           * scale
-    eff_v     = MIN_PEAK_SPEED_PX     * scale
+    eff_v     = max(MIN_PEAK_SPEED_PX * scale, MIN_PEAK_SPEED_FLOOR_PX)
     eff_vx    = MIN_OUTBOUND_VX_PX    * scale
 
     if float(np.hypot(x[-1] - x[0], y[-1] - y[0])) < eff_disp:
@@ -1056,7 +1063,7 @@ def _check_burst(points, wall_dir):
     safe_dt = np.where(dts > 1e-6, dts, 1e-6)
     speeds = np.hypot(dxs, dys) / safe_dt
     peak_speed = float(np.max(speeds)) if speeds.size else 0.0
-    if peak_speed < MIN_BURST_SPEED_PX * scale:
+    if peak_speed < max(MIN_BURST_SPEED_PX * scale, MIN_PEAK_SPEED_FLOOR_PX):
         return None
 
     # Frame-to-frame x-delta sign — rejects stick-mesh flicker (random jumps).

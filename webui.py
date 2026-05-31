@@ -724,6 +724,28 @@ class Runner:
         self.running = True
         self.thread.start()
 
+    def request_restart(self):
+        """Restart the whole app: exit the process so the run_pi.sh supervisor
+        relaunches it fresh (~3s later).  Stops the loop, finalizes any active
+        session CSV, and releases the camera so the device frees cleanly before
+        the reopen.  If not running under the supervisor it simply quits."""
+        def _go():
+            time.sleep(0.4)                 # let the HTTP response flush first
+            self.running = False            # stop the capture/process loop
+            time.sleep(0.2)                 # let the in-flight iteration finish
+            try:
+                if self.engine.session_active:
+                    self.engine.stop_session()
+            except Exception:
+                pass
+            try:
+                if self.raw_release:
+                    self.raw_release()      # free the camera before exit
+            except Exception:
+                pass
+            os._exit(0)                     # supervisor relaunches with new code
+        threading.Thread(target=_go, daemon=True).start()
+
     def _make_placeholder(self, msg="connecting to camera..."):
         img = np.full((wb.FRAME_H, wb.FRAME_W, 3), 24, np.uint8)
         cv2.putText(img, msg, (40, wb.FRAME_H // 2),
@@ -1128,6 +1150,13 @@ def api_session_stop():
 @app.route("/api/session/reset", methods=["POST"])
 def api_session_reset():
     runner.engine.reset_counts()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/restart", methods=["POST"])
+def api_restart():
+    """Restart the whole tracker process (the supervisor relaunches it)."""
+    runner.request_restart()
     return jsonify({"ok": True})
 
 
