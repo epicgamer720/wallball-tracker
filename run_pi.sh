@@ -25,8 +25,10 @@ echo $$ > "$PIDFILE"
 BTN_PINS="--btn-pins 1:3,1:20,2:27"
 
 # Supervisor loop: restart the app whenever it exits.
+# Web UI only — no --screen, so the on-screen HUD is off and the physical
+# buttons (passed below but screen-coupled) are inactive; control via the web UI.
 while true; do
-    python3 webui.py --screen --wall-side right $BTN_PINS >> "$LOG" 2>&1
+    python3 webui.py --wall-side right $BTN_PINS >> "$LOG" 2>&1
     echo "[run_pi] webui exited (code $?) at $(date '+%F %T') — restarting in 3s" >> "$LOG"
     sleep 3
 done

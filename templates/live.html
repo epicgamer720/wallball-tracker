@@ -39,7 +39,10 @@
         <button onclick="bumpTarget(-5)">&minus;</button><b id="targetval">40</b><button onclick="bumpTarget(5)">+</button>
         <span class="muted">/min</span>
       </div>
-      <button id="soundbtn" onclick="toggleSound()">&#128266; Sound on</button>
+      <div class="row" style="gap:8px">
+        <button id="soundbtn" onclick="toggleSound()">&#128266; Cues on</button>
+        <button id="metrobtn" onclick="toggleMetro()">&#127925; Metronome</button>
+      </div>
     </div>
     <div class="row spread" style="margin-top:8px">
       <div class="stepper">
@@ -58,7 +61,6 @@
     <div class="row">
       <button class="danger" onclick="stopSession()">Stop &amp; save &rarr;</button>
       <button onclick="postJSON('/api/session/reset')">Reset counts</button>
-      <button onclick="restartApp()" title="Restart the tracker program">&#8635; Restart app</button>
     </div>
   </div>
 </div>
@@ -91,11 +93,6 @@ async function stopSession() {
   const id = r.summary && r.summary.id;
   window.location = '/analytics' + (id ? ('?session=' + id) : '');
 }
-async function restartApp() {
-  if (!confirm('Restart the tracker program? The video will drop for a few seconds while it relaunches.')) return;
-  try { await postJSON('/api/restart'); } catch (e) {}
-  setNavStatus('restarting — reconnecting...');
-}
 async function poll() {
   const s = await api('/api/stats');
   document.getElementById('nosession').style.display = s.session_active ? 'none' : 'block';
@@ -118,6 +115,7 @@ let SOUND = localStorage.getItem('wb_sound') !== '0';
 const TOL = 0.18;                       // +/-18% target band
 let paceState = 'warm', candState = 'warm', candCount = 0;
 let breakBaseline = 0, breakActive = false, lastReps = 0, coachStarted = false;
+let METRO = localStorage.getItem('wb_metro') === '1', metroTimer = null;
 let audioCtx = null;
 
 function ensureAudio() {
@@ -203,6 +201,7 @@ function bumpTarget(d) {
   TARGET = Math.max(5, Math.min(200, TARGET + d));
   localStorage.setItem('wb_target', TARGET);
   document.getElementById('targetval').textContent = TARGET; renderPace();
+  if (METRO) startMetro();          // re-time the tick to the new target
 }
 function bumpBreak(d) {
   BREAKEVERY = Math.max(0, Math.min(500, BREAKEVERY + d));
@@ -216,14 +215,30 @@ function resetBreak() {
 }
 function toggleSound() {
   SOUND = !SOUND; localStorage.setItem('wb_sound', SOUND ? '1' : '0');
-  document.getElementById('soundbtn').textContent = SOUND ? '🔊 Sound on' : '🔇 Muted';
-  if (SOUND) { ensureAudio(); beep(880, 0.09); say('sound on'); }
+  document.getElementById('soundbtn').textContent = SOUND ? '🔊 Cues on' : '🔇 Cues off';
+  if (SOUND) { ensureAudio(); beep(880, 0.09); say('cues on'); }
+}
+// Metronome: a steady tick at the target cadence — match it by ear.
+function metroTick() { beep(1000, 0.045, 0, 0.22, 'square'); }
+function startMetro() {
+  stopMetro();
+  if (!METRO) return;
+  ensureAudio();
+  metroTimer = setInterval(metroTick, 60000 / Math.max(TARGET, 1));
+}
+function stopMetro() { if (metroTimer) { clearInterval(metroTimer); metroTimer = null; } }
+function toggleMetro() {
+  METRO = !METRO; localStorage.setItem('wb_metro', METRO ? '1' : '0');
+  document.getElementById('metrobtn').textContent = METRO ? '🎵 Metronome on' : '🎵 Metronome';
+  if (METRO) { ensureAudio(); metroTick(); startMetro(); } else stopMetro();
 }
 function initCoach() {
   document.getElementById('targetval').textContent = TARGET;
   document.getElementById('breakval').textContent = BREAKEVERY || 'off';
-  document.getElementById('soundbtn').textContent = SOUND ? '🔊 Sound on' : '🔇 Muted';
+  document.getElementById('soundbtn').textContent = SOUND ? '🔊 Cues on' : '🔇 Cues off';
+  document.getElementById('metrobtn').textContent = METRO ? '🎵 Metronome on' : '🎵 Metronome';
   renderPace();
+  if (METRO) startMetro();
   // Browsers require a user gesture before audio can play; unlock on first tap.
   window.addEventListener('pointerdown', ensureAudio, { once: true });
 }

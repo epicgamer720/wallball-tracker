@@ -17,6 +17,13 @@
   </div>
   <p class="caption" style="margin-top:10px">Switching resolution briefly reopens the
     camera (the preview blinks for a second). Both choices are remembered across restarts.</p>
+  <div class="spacer"></div>
+  <div class="muted" style="margin-bottom:8px">App</div>
+  <div class="row">
+    <button onclick="restartApp()" title="Restart the tracker program">&#8635; Restart app</button>
+  </div>
+  <p class="caption" style="margin-top:10px">Restarts the whole tracker process
+    (the video drops for a few seconds while it relaunches).</p>
 </div>
 <div class="spacer"></div>
 <div class="summary-cards">
@@ -118,6 +125,11 @@ async function setWall(side) {
   const r = await postJSON('/api/wall', { side });
   markWall(r.wall);
   setNavStatus('wall side: ' + r.wall);
+}
+async function restartApp() {
+  if (!confirm('Restart the tracker program? The video drops for a few seconds while it relaunches.')) return;
+  try { await postJSON('/api/restart'); } catch (e) {}
+  setNavStatus('restarting — reconnecting…');
 }
 loadConfig();
 poll();
