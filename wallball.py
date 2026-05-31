@@ -266,6 +266,13 @@ GROUND_LOST_GRACE_S = 0.4
 HSV_CALIB_PATH      = "hsv_calibration.json"
 HSV_SAMPLE_BOX_PX   = 60        # side of the center crosshair sampling box
 HSV_MARGIN          = np.array([4, 30, 35], dtype=np.int16)  # H, S, V — tight enough to exclude skin
+# Caps on the *low* bounds a sample may produce.  A ball sampled off a bright
+# specular glint (or in much brighter light than it's played in) yields a high
+# S/V floor that then matches nothing in normal light — the V>=220 trap that
+# blanked the mask in the field.  Never let the sampled S/V floor rise so high
+# the ball's own body is excluded; the hue floor is left alone.
+HSV_SAMPLE_SFLOOR_MAX = 110     # S floor is never sampled above this
+HSV_SAMPLE_VFLOOR_MAX = 90      # V floor is never sampled above this
 
 # -------------------------------------------------------------------------
 
@@ -365,6 +372,10 @@ def sample_hsv_from(frame, best=None, box_px=HSV_SAMPLE_BOX_PX,
     p_high = np.percentile(samples, 95, axis=0).astype(np.int16)
     lo = np.clip(p_low  - margin, [0, 0, 0],     [179, 255, 255]).astype(np.uint8)
     hi = np.clip(p_high + margin, [0, 0, 0],     [179, 255, 255]).astype(np.uint8)
+    # Glint guard: cap the S/V floors so a bright/specular sample can't exclude
+    # the ball body in normal light (kills the V>=220 mask-blanking trap).
+    lo[1] = min(int(lo[1]), HSV_SAMPLE_SFLOOR_MAX)
+    lo[2] = min(int(lo[2]), HSV_SAMPLE_VFLOOR_MAX)
     return lo, hi
 
 
