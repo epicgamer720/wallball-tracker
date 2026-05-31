@@ -129,6 +129,18 @@ TRACK_SEARCH_PX         = 110.0  # scale of soft proximity bonus
 TRACK_BONUS             = 3.0
 TRACK_LOST_GAP_S        = 0.30
 
+# Anchor coasting + speed-aware gate (throw survival).  A fast throw motion-
+# blurs the ball, so single-frame detection drops out for a few frames.  Rather
+# than freezing the anchor where the ball vanished (then falling to strict
+# re-acquire), keep the loose-gated anchor alive a little longer and slide it
+# along the ball's last measured velocity, so the search region follows the
+# ball through the blur and the loose gates can re-grab it on the far side.
+COAST_EXTRA_S       = 0.12   # keep the loose-gated anchor this long past TRACK_LOST_GAP_S
+COAST_MAX_S         = 0.12   # cap how far ahead to extrapolate (constant-v is only good briefly)
+COAST_VEL_SPAN_S    = 0.04   # estimate velocity over >= this much trail history (de-noise)
+TRACK_JUMP_K        = 1.5    # allow per-frame jumps up to K x (speed x time-since-last-fix)
+TRACK_JUMP_MAX_PX   = 300.0  # absolute cap on the widened hard gate (px)
+
 # Ghost-anchor (position-only memory after the strict anchor expires).
 # Survives brief occlusion — when the ball emerges, the visible blob near
 # the last-known location wins via proximity bonus.  Tuned softer than
@@ -138,6 +150,16 @@ TRACK_LOST_GAP_S        = 0.30
 GHOST_ANCHOR_GAP_S      = 2.0
 GHOST_ANCHOR_RANGE_PX   = 130.0
 GHOST_ANCHOR_BONUS      = 2.0    # mild bias, not a takeover
+GHOST_REACQUIRE_CIRC    = 0.50   # circularity gate while a ghost anchor is live
+                                 # — between strict (0.60) and loose (0.40).
+                                 # Occlusion/blur knocks a reappearing ball's
+                                 # circularity down; the proximity prior already
+                                 # guards against distant noise, so relax here so
+                                 # the ball can re-lock near where it vanished.
+                                 # Radius stays strict (a half-occluded ball
+                                 # keeps its enclosing-circle radius, so radius
+                                 # is the right speck filter to retain).  Push
+                                 # toward 0.40 if recovery is still poor.
 
 # Fragment-fit fallback: when the ball is heavily occluded by a lacrosse
 # stick mesh or a hand, no single contour looks like a ball.  Instead the
@@ -504,25 +526,31 @@ class MaskContourWorker:
         self.min_circularity_strict = min_circularity_strict
         # Absolute size floor applied in every mode (tunable at runtime).
         self.min_ball_radius_px     = MIN_BALL_RADIUS_PX
+        # Relaxed circularity for ghost-anchor re-acquire (tunable at runtime).
+        self.ghost_reacquire_circ   = GHOST_REACQUIRE_CIRC
         self._in_q   = queue.Queue(maxsize=1)
         self._out_q  = queue.Queue(maxsize=1)
         self._stop   = False
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
-    def submit(self, frame, frame_idx, t, anchor=None, ghost_anchor=None):
+    def submit(self, frame, frame_idx, t, anchor=None, ghost_anchor=None,
+               max_jump_px=None):
         """anchor: (cx, cy, r) of recent detection — when set, enables
             tracking mode (loose gates + size lock + proximity bonus).
         ghost_anchor: (cx, cy) of last-known ball position — used in
             re-acquire mode (strict gates) as a proximity prior so the
-            ball wins over distant specs when it reappears."""
+            ball wins over distant specs when it reappears.
+        max_jump_px: speed-aware hard distance gate for tracking mode; None
+            falls back to the flat TRACK_HARD_PX."""
         # Drop the previous unprocessed input; keep only the latest.
         try:
             self._in_q.get_nowait()
         except queue.Empty:
             pass
         try:
-            self._in_q.put_nowait((frame, frame_idx, t, anchor, ghost_anchor))
+            self._in_q.put_nowait((frame, frame_idx, t, anchor, ghost_anchor,
+                                   max_jump_px))
         except queue.Full:
             pass
 
@@ -539,17 +567,28 @@ class MaskContourWorker:
     def _loop(self):
         while not self._stop:
             try:
-                frame, frame_idx, t, anchor, ghost_anchor = self._in_q.get(timeout=0.1)
+                (frame, frame_idx, t, anchor, ghost_anchor,
+                 max_jump_px) = self._in_q.get(timeout=0.1)
             except queue.Empty:
                 continue
-            # Two-mode gates: strict if no anchor (re-acquire), loose if
-            # anchor (tracking through partial occlusion).
-            if anchor is None:
-                min_r  = self.min_radius_px_strict
-                min_c  = self.min_circularity_strict
-            else:
+            # Per-frame hard-distance gate (speed-aware; falls back to the flat
+            # TRACK_HARD_PX when the caller didn't supply one).
+            hard_px = max_jump_px if max_jump_px is not None else TRACK_HARD_PX
+            # Gate modes, most→least permissive by how strong our prior is:
+            #   anchor  -> loose (tracking through partial occlusion)
+            #   ghost   -> strict radius (reject specks) + RELAXED circularity,
+            #              since the proximity prior guards spatially and a
+            #              reappearing ball is often occluded/blurred (low circ)
+            #   neither -> fully strict (cold-start re-acquire, no prior)
+            if anchor is not None:
                 min_r  = self.min_radius_px
                 min_c  = self.min_circularity
+            elif ghost_anchor is not None:
+                min_r  = self.min_radius_px_strict
+                min_c  = self.ghost_reacquire_circ
+            else:
+                min_r  = self.min_radius_px_strict
+                min_c  = self.min_circularity_strict
             # Absolute floor — never accept a ball smaller than this, in any
             # mode.  Kills tiny-speck lock-on and anchor ratcheting.
             min_r = max(min_r, self.min_ball_radius_px)
@@ -613,9 +652,11 @@ class MaskContourWorker:
                         dx = cx_m - anchor[0]
                         dy = cy_m - anchor[1]
                         dist = math.sqrt(dx * dx + dy * dy)
-                        # HARD REJECT — outside the search radius the ball
-                        # cannot possibly have moved to in one frame.
-                        if dist > TRACK_HARD_PX:
+                        # HARD REJECT — outside the (speed-aware) radius the
+                        # ball could plausibly have moved to since the last real
+                        # fix.  hard_px grows with measured speed so a fast throw
+                        # isn't rejected for "jumping too far" (esp. low fps).
+                        if dist > hard_px:
                             continue
                         # Asymmetric size tolerance: shrinking is OK
                         # (occlusion), growing past TRACK_GROW_TOL is not.
@@ -871,6 +912,57 @@ def r2_score(y, yhat):
     ss_res = float(np.sum((y - yhat) ** 2))
     ss_tot = float(np.sum((y - y.mean()) ** 2))
     return 1.0 - ss_res / ss_tot if ss_tot > 1e-9 else 0.0
+
+
+def _recent_velocity(trail, span_s):
+    """Estimate the ball's recent image-plane velocity (px/s) from the trail.
+    Uses the latest point and the most recent point at least `span_s` older so
+    frame-to-frame noise at high fps doesn't dominate.  Returns (vx, vy), or
+    (0.0, 0.0) when there isn't enough history."""
+    if len(trail) < 2:
+        return 0.0, 0.0
+    last = trail[-1]
+    ref = trail[0]
+    for p in reversed(trail):
+        if last[0] - p[0] >= span_s:
+            ref = p
+            break
+    dt = last[0] - ref[0]
+    if dt < 1e-6:
+        return 0.0, 0.0
+    return (last[1] - ref[1]) / dt, (last[2] - ref[2]) / dt
+
+
+def coasted_anchor(last_seen_pos, last_seen_at, last_known_r, trail, now,
+                   frame_w, frame_h):
+    """Build the worker's (anchor, ghost_anchor, max_jump_px) for this frame,
+    sliding the last-known position along the ball's measured velocity so the
+    search region follows a fast/blurred ball through frames where detection
+    momentarily drops (throw survival).  Constant-velocity is only good
+    briefly, so the extrapolation is capped at COAST_MAX_S.
+
+      - within TRACK_LOST_GAP_S + COAST_EXTRA_S -> strict anchor (loose gates)
+      - else within GHOST_ANCHOR_GAP_S          -> ghost anchor (strict gates)
+      - else                                    -> cold start (both None)
+
+    max_jump_px (the tracking-mode hard distance gate) grows with measured
+    speed so a genuinely fast ball isn't rejected for jumping too far — which
+    matters when fps dips and the per-frame displacement is large."""
+    if last_seen_pos is None:
+        return None, None, TRACK_HARD_PX
+    age = now - last_seen_at
+    vx, vy = _recent_velocity(trail, COAST_VEL_SPAN_S)
+    coast_dt = min(age, COAST_MAX_S)
+    px = float(np.clip(last_seen_pos[0] + vx * coast_dt, 0, frame_w - 1))
+    py = float(np.clip(last_seen_pos[1] + vy * coast_dt, 0, frame_h - 1))
+    speed = math.hypot(vx, vy)
+    max_jump = float(np.clip(TRACK_JUMP_K * speed * max(age, 1e-3),
+                             TRACK_HARD_PX, TRACK_JUMP_MAX_PX))
+    if age < TRACK_LOST_GAP_S + COAST_EXTRA_S and last_known_r is not None:
+        return (px, py, last_known_r), None, max_jump
+    if age < GHOST_ANCHOR_GAP_S:
+        return None, (px, py), max_jump
+    return None, None, TRACK_HARD_PX
 
 
 def _fit_window(window, wall_dir):
@@ -1283,16 +1375,13 @@ def main():
             #                   apply, but blobs near here get a score
             #                   bonus so the ball wins over noise when
             #                   it pops back out of an occluding stick.
-            anchor       = None
-            ghost_anchor = None
-            if last_seen_pos is not None:
-                age = capture_t - last_seen_at
-                if age < TRACK_LOST_GAP_S and last_known_r is not None:
-                    anchor = (last_seen_pos[0], last_seen_pos[1], last_known_r)
-                elif age < GHOST_ANCHOR_GAP_S:
-                    ghost_anchor = (last_seen_pos[0], last_seen_pos[1])
+            # Coast the anchor along the ball's measured velocity and widen the
+            # hard gate with speed (throw survival — see coasted_anchor()).
+            anchor, ghost_anchor, max_jump_px = coasted_anchor(
+                last_seen_pos, last_seen_at, last_known_r, trail,
+                capture_t, FRAME_W, FRAME_H)
             cv_worker.submit(capture_frame, frame_idx, capture_t,
-                             anchor, ghost_anchor)
+                             anchor, ghost_anchor, max_jump_px)
             frame_idx += 1
 
             # 3. Pull the freshest worker result.  None on the first few

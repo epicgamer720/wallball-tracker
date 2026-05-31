@@ -243,16 +243,13 @@ class Engine:
             capture_frame = cv2.resize(capture_frame,
                                        (self.frame_w, self.frame_h))
 
-        anchor = ghost = None
-        if self.last_seen_pos is not None:
-            age = capture_t - self.last_seen_at
-            if age < wb.TRACK_LOST_GAP_S and self.last_known_r is not None:
-                anchor = (self.last_seen_pos[0], self.last_seen_pos[1],
-                          self.last_known_r)
-            elif age < wb.GHOST_ANCHOR_GAP_S:
-                ghost = (self.last_seen_pos[0], self.last_seen_pos[1])
+        # Coast the anchor along the ball's velocity + speed-aware hard gate so
+        # a fast/blurred throw keeps its lock (see wb.coasted_anchor()).
+        anchor, ghost, max_jump_px = wb.coasted_anchor(
+            self.last_seen_pos, self.last_seen_at, self.last_known_r,
+            self.trail, capture_t, self.frame_w, self.frame_h)
         self.cv_worker.submit(capture_frame, self.frame_idx, capture_t,
-                              anchor, ghost)
+                              anchor, ghost, max_jump_px)
         self.frame_idx += 1
         result = self.cv_worker.get_latest()
         if result is None:
