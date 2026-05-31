@@ -4,6 +4,11 @@
   No session running. Go to <a href="{{ url_for('setup') }}">Setup</a> to calibrate and start one.
 </div>
 
+<div id="breakbanner" class="coachbanner" style="display:none">
+  <span>&#128167; <b>Take a break</b> &mdash; <b id="breakreps">0</b> reps done. Rest up, then tap &rarr;</span>
+  <button class="primary" onclick="resetBreak()">Done resting</button>
+</div>
+
 <div class="grid cols-2" id="livegrid">
   <div class="panel">
     <div class="videowrap"><img id="stream" src="{{ url_for('stream_video') }}" alt="live"></div>
@@ -21,6 +26,28 @@
       <div class="card"><div class="k">Cadence</div><div class="v cyan"><span id="cpm">0</span><small style="font-size:14px"> /min</small></div></div>
       <div class="card"><div class="k">Drops</div><div class="v orange" id="drops">0</div></div>
       <div class="card"><div class="k">Last rep</div><div class="v" id="lastrep">--</div></div>
+    </div>
+
+    <div class="spacer"></div>
+    <div id="pacebox" class="pacebox warm">
+      <div class="pacebig"><span id="paceicon">&mdash;</span><span id="pacetext">warming up</span></div>
+      <div class="pacesub" id="pacesub">set your target pace</div>
+    </div>
+    <div class="row spread" style="margin-top:10px">
+      <div class="stepper">
+        <span class="muted">Target</span>
+        <button onclick="bumpTarget(-5)">&minus;</button><b id="targetval">40</b><button onclick="bumpTarget(5)">+</button>
+        <span class="muted">/min</span>
+      </div>
+      <button id="soundbtn" onclick="toggleSound()">&#128266; Sound on</button>
+    </div>
+    <div class="row spread" style="margin-top:8px">
+      <div class="stepper">
+        <span class="muted">Break every</span>
+        <button onclick="bumpBreak(-10)">&minus;</button><b id="breakval">60</b><button onclick="bumpBreak(10)">+</button>
+        <span class="muted">reps</span>
+      </div>
+      <span class="muted" id="breakprogress">0 since break</span>
     </div>
 
     <div class="spacer"></div>
@@ -82,9 +109,128 @@ async function poll() {
   st.textContent = s.state; st.className = 'statepill ' + s.state;
   if (s.status) setNavStatus(s.status);
   if (s.session_active) pushCad(s.elapsed_s, s.cpm);
+  updateCoach(s);
 }
+// ---- pace + break coaching (client-side; uses cpm/reps from /api/stats) ----
+let TARGET = +(localStorage.getItem('wb_target') || 40);
+let BREAKEVERY = +(localStorage.getItem('wb_breakevery') || 60);
+let SOUND = localStorage.getItem('wb_sound') !== '0';
+const TOL = 0.18;                       // +/-18% target band
+let paceState = 'warm', candState = 'warm', candCount = 0;
+let breakBaseline = 0, breakActive = false, lastReps = 0, coachStarted = false;
+let audioCtx = null;
+
+function ensureAudio() {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  } catch (e) {}
+  return audioCtx;
+}
+function beep(freq, dur, when = 0, vol = 0.18, type = 'sine') {
+  const ac = ensureAudio(); if (!ac) return;
+  const t = ac.currentTime + when;
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = type; o.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.linearRampToValueAtTime(vol, t + 0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g).connect(ac.destination);
+  o.start(t); o.stop(t + dur + 0.03);
+}
+function say(text) {
+  if (!SOUND || !('speechSynthesis' in window)) return;
+  try { speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text); u.rate = 1.1; speechSynthesis.speak(u);
+  } catch (e) {}
+}
+function cue(state) {
+  if (!SOUND) return;
+  if (state === 'speedup')       { beep(659, 0.12); beep(988, 0.13, 0.13); say('speed up'); }
+  else if (state === 'slowdown') { beep(523, 0.14); beep(330, 0.17, 0.15); say('slow down'); }
+  else if (state === 'onpace')   { beep(880, 0.10, 0, 0.13); }
+  else if (state === 'break')    { beep(740, 0.16); beep(740, 0.16, 0.24); beep(988, 0.32, 0.5, 0.2); say('take a break'); }
+}
+function renderPace() {
+  const box = document.getElementById('pacebox');
+  const map = { warm: ['—', 'warming up'], speedup: ['⬆', 'SPEED UP'],
+                onpace: ['✓', 'ON PACE'], slowdown: ['⬇', 'SLOW DOWN'] };
+  const m = map[paceState] || map.warm;
+  box.className = 'pacebox ' + paceState;
+  document.getElementById('paceicon').textContent = m[0];
+  document.getElementById('pacetext').textContent = m[1];
+  const lo = Math.round(TARGET * (1 - TOL)), hi = Math.round(TARGET * (1 + TOL));
+  document.getElementById('pacesub').textContent =
+    breakActive ? 'resting — tap "Done resting" when ready'
+                : 'target ' + TARGET + '/min  (ok ' + lo + '–' + hi + ')';
+}
+function updateCoach(s) {
+  const reps = s.reps | 0;
+  if (!coachStarted) {                    // anchor break count to first load (no spurious break on reload)
+    coachStarted = true; lastReps = reps; breakBaseline = reps;
+  }
+  if (reps < lastReps) {                 // session was reset -> clear break state
+    breakBaseline = 0; breakActive = false;
+    document.getElementById('breakbanner').style.display = 'none';
+  }
+  lastReps = reps;
+  const sinceBreak = Math.max(0, reps - breakBaseline);
+  document.getElementById('breakprogress').textContent = sinceBreak + ' since break';
+  if (!breakActive && s.session_active && BREAKEVERY > 0 && sinceBreak >= BREAKEVERY) {
+    breakActive = true;
+    document.getElementById('breakreps').textContent = sinceBreak;
+    document.getElementById('breakbanner').style.display = 'flex';
+    cue('break');
+  }
+  if (breakActive) {                     // don't nag about pace while resting
+    if (paceState !== 'warm') paceState = 'warm';
+    renderPace(); return;
+  }
+  let want;
+  if (!s.session_active || reps < 3 || s.elapsed_s < 8) want = 'warm';
+  else if (s.cpm < TARGET * (1 - TOL)) want = 'speedup';
+  else if (s.cpm > TARGET * (1 + TOL)) want = 'slowdown';
+  else want = 'onpace';
+  // hysteresis: a new state must hold ~2 polls (1s) before it commits/announces
+  if (want === candState) candCount++; else { candState = want; candCount = 1; }
+  if (candCount >= 2 && want !== paceState) {
+    paceState = want;
+    if (want !== 'warm') cue(want);
+  }
+  renderPace();
+}
+function bumpTarget(d) {
+  TARGET = Math.max(5, Math.min(200, TARGET + d));
+  localStorage.setItem('wb_target', TARGET);
+  document.getElementById('targetval').textContent = TARGET; renderPace();
+}
+function bumpBreak(d) {
+  BREAKEVERY = Math.max(0, Math.min(500, BREAKEVERY + d));
+  localStorage.setItem('wb_breakevery', BREAKEVERY);
+  document.getElementById('breakval').textContent = BREAKEVERY || 'off';
+}
+function resetBreak() {
+  breakBaseline = lastReps; breakActive = false;
+  document.getElementById('breakbanner').style.display = 'none';
+  renderPace();
+}
+function toggleSound() {
+  SOUND = !SOUND; localStorage.setItem('wb_sound', SOUND ? '1' : '0');
+  document.getElementById('soundbtn').textContent = SOUND ? '🔊 Sound on' : '🔇 Muted';
+  if (SOUND) { ensureAudio(); beep(880, 0.09); say('sound on'); }
+}
+function initCoach() {
+  document.getElementById('targetval').textContent = TARGET;
+  document.getElementById('breakval').textContent = BREAKEVERY || 'off';
+  document.getElementById('soundbtn').textContent = SOUND ? '🔊 Sound on' : '🔇 Muted';
+  renderPace();
+  // Browsers require a user gesture before audio can play; unlock on first tap.
+  window.addEventListener('pointerdown', ensureAudio, { once: true });
+}
+
 (function init() {
   initChart();
+  initCoach();
   poll();
   setInterval(poll, 500);
 })();
