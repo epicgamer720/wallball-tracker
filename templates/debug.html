@@ -54,6 +54,31 @@
 </div>
 
 <div class="spacer"></div>
+<div class="panel">
+  <h2>Tuning <span class="hint">live &middot; saved across restarts</span></h2>
+  <div class="slider">
+    <label>Ball-gone gap <b><span id="rgVal">--</span>s</b></label>
+    <input type="range" id="rg" min="0.02" max="0.60" step="0.01"
+           oninput="tuneShow('rg','rgVal')" onchange="setTune('release_gap', this.value)">
+    <p class="caption">How long the ball must be gone before a throw counts as released.
+      Higher = fewer false counts (esp. with Loose lock); a touch slower to register.</p>
+  </div>
+  <div class="slider">
+    <label>Loose-lock hold <b><span id="lhVal">--</span>s</b></label>
+    <input type="range" id="lh" min="0" max="1.5" step="0.05"
+           oninput="tuneShow('lh','lhVal')" onchange="setTune('loose_hold', this.value)">
+    <p class="caption">In Loose lock, how long to keep tracking a colour smear after the last
+      real detection before declaring the ball gone. 0 disables the colour-blob fallback.</p>
+  </div>
+  <div class="slider">
+    <label>Ghost memory <b><span id="ggVal">--</span>s</b></label>
+    <input type="range" id="gg" min="0.5" max="4.0" step="0.1"
+           oninput="tuneShow('gg','ggVal')" onchange="setTune('ghost_gap', this.value)">
+    <p class="caption">How long to remember the ball's last position to re-acquire it after a loss.</p>
+  </div>
+</div>
+
+<div class="spacer"></div>
 <div class="grid cols-2">
   <div class="panel">
     <h2>CPU cores</h2>
@@ -81,7 +106,8 @@
 .corebar .lab { width: 32px; color: var(--muted); font-size: 12px; }
 .corebar .track { flex: 1; height: 14px; background: var(--panel2);
   border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
-.corebar .fill { height: 100%; background: var(--cyan); transition: width .3s; }
+.corebar .fill { display: block; height: 100%; background: var(--cyan);
+  min-width: 2px; transition: width .3s; }
 .corebar .pct { width: 44px; text-align: right; font-size: 12px;
   font-variant-numeric: tabular-nums; }
 </style>
@@ -141,12 +167,26 @@ async function toggleLoose() {
   const r = await postJSON('/api/loose', { on: !cur });
   markLoose(r.loose); setNavStatus('loose lock ' + (r.loose ? 'on' : 'off'));
 }
+function tuneShow(s, l) { document.getElementById(l).textContent = (+document.getElementById(s).value).toFixed(2); }
+async function setTune(key, value) {
+  const r = await postJSON('/api/tune', { key, value: +value });
+  setNavStatus(r.ok ? (key + ' = ' + r.value) : ('tune failed: ' + key));
+}
+function loadTune(t) {
+  const map = { release_gap: ['rg', 'rgVal'], loose_hold: ['lh', 'lhVal'], ghost_gap: ['gg', 'ggVal'] };
+  for (const k in map) {
+    if (!t || t[k] == null) continue;
+    const [s, l] = map[k];
+    document.getElementById(s).value = t[k];
+    document.getElementById(l).textContent = (+t[k]).toFixed(2);
+  }
+}
 async function loadConfig() {
   const c = await api('/api/config');
   document.getElementById('resBtns').innerHTML = Object.entries(c.presets).map(
     ([id, label]) => `<button data-pid="${id}" onclick="setRes('${id}')">${label}</button>`).join('');
   markRes(c.preset); markWall(c.wall);
-  markFlip(c.flip180); markLoose(c.loose);
+  markFlip(c.flip180); markLoose(c.loose); loadTune(c.tune);
 }
 async function setRes(pid) {
   const r = await postJSON('/api/resolution', { preset: pid });

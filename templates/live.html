@@ -14,6 +14,7 @@
     <div class="videowrap"><img id="stream" src="{{ url_for('stream_video') }}" alt="live"></div>
     <div class="row spread" style="margin-top:14px">
       <span class="statepill" id="state">--</span>
+      <span id="blobind" style="display:none;color:#e879f9;font-weight:700">&#9679; blur-lock</span>
       <span class="muted">elapsed <b id="elapsed">0s</b> &middot; <b id="fps">0</b> fps</span>
     </div>
   </div>
@@ -104,6 +105,7 @@ async function poll() {
   document.getElementById('elapsed').textContent = s.elapsed_s.toFixed(0) + 's';
   const st = document.getElementById('state');
   st.textContent = s.state; st.className = 'statepill ' + s.state;
+  document.getElementById('blobind').style.display = s.blob_lock ? 'inline-block' : 'none';
   if (s.status) setNavStatus(s.status);
   if (s.session_active) pushCad(s.elapsed_s, s.cpm);
   updateCoach(s);

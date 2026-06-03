@@ -202,6 +202,8 @@ LOOSE_LOCK_CIRC      = 0.20      # circularity gate while loose-lock is on (anch
 BLOB_WIN_R           = 2.6       # colour-blob search half-window = this * anchor.r
 BLOB_WIN_MIN_PX      = 26.0      # ...but at least this half-width (detection-res px)
 BLOB_MIN_FILL        = 0.18      # need >= this fraction of the anchor disc filled with colour
+BLOB_MAX_HOLD_S      = 0.45      # loose-lock coasts on the colour blob at most this long since
+                                 # the last REAL detection, then lets go (ball-gone). 0 = off.
 
 # Parabolic-fit thresholds — loosened so fast, blurry, near-straight wall
 # ball throws still produce a candidate.  The speed gates below do the real
@@ -586,6 +588,7 @@ class MaskContourWorker:
         # Loose-lock mode (set at runtime from the web UI): drop the shape gate
         # and enable the colour-blob fallback so blur keeps the lock.
         self.loose_lock             = False
+        self._last_real_t           = -1e9   # t of the last real (non-blob) detection
         self._in_q   = queue.Queue(maxsize=1)
         self._out_q  = queue.Queue(maxsize=1)
         self._stop   = False
@@ -657,6 +660,7 @@ class MaskContourWorker:
             # mode.  Kills tiny-speck lock-on and anchor ratcheting.
             min_r = max(min_r, self.min_ball_radius_px)
             min_area = math.pi * min_r * min_r * 0.5
+            synth_blob = False               # did `best` come from the colour blob?
             try:
                 # Run the heavy pixel ops at ~640 wide regardless of capture
                 # resolution, then scale the contours back to full res.  This
@@ -770,18 +774,26 @@ class MaskContourWorker:
                         if synth is not None:
                             best = synth
 
+                # Track the last REAL (contour/fragment) detection so the
+                # colour fallback below can't sustain a lock indefinitely.
+                if best is not None:
+                    self._last_real_t = t
+
                 # --- Colour-blob fallback (loose-lock only). -------------
                 # Nothing passed even the relaxed gates and geometric fit, but
-                # in loose-lock we still track a blurred smear of the right
-                # colour by its centroid in a window around the anchor.  Keeps
-                # the lock through fast motion; off by default.
+                # in loose-lock we briefly track a blurred smear of the right
+                # colour by its centroid near the anchor.  Bounded by
+                # BLOB_MAX_HOLD_S (time since the last real detection) so it
+                # lets go when the ball is actually gone (tunable in Debug).
                 if (self.loose_lock and best is None
-                        and anchor is not None and anchor[2] > 0):
+                        and anchor is not None and anchor[2] > 0
+                        and (t - self._last_real_t) < BLOB_MAX_HOLD_S):
                     c = _color_blob_centroid(mask, anchor[0] * ms,
                                              anchor[1] * ms, anchor[2] * ms)
                     if c is not None:
                         best = (float(c[0] * inv), float(c[1] * inv),
                                 float(anchor[2]))
+                        synth_blob = True
             except Exception:
                 continue
             # Replace any stale output with the new result.
@@ -790,7 +802,7 @@ class MaskContourWorker:
             except queue.Empty:
                 pass
             try:
-                self._out_q.put_nowait((frame, frame_idx, t, mask, best))
+                self._out_q.put_nowait((frame, frame_idx, t, mask, best, synth_blob))
             except queue.Full:
                 pass
 
@@ -1466,7 +1478,7 @@ def main():
             result = cv_worker.get_latest()
             if result is None:
                 continue
-            frame, _w_idx, now, mask, best = result
+            frame, _w_idx, now, mask, best, _blob = result
 
             do_draw = (not args.no_display
                        and (frame_idx % DISPLAY_EVERY_N) == 0)

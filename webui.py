@@ -49,6 +49,15 @@ RES_PRESETS = {
 RUNTIME_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "runtime.json")
 
+# Live-tunable detection params exposed in Debug.  Maps a web key to the
+# wallball module attribute it sets and its (min, max) clamp.  Setting the
+# module attr takes effect immediately (loop/worker read them each frame).
+TUNE_KEYS = {
+    "release_gap": ("RELEASE_GAP_S",      (0.02, 0.60)),
+    "loose_hold":  ("BLOB_MAX_HOLD_S",    (0.0,  1.5)),
+    "ghost_gap":   ("GHOST_ANCHOR_GAP_S", (0.5,  4.0)),
+}
+
 
 # --- Detection engine (wraps wallball's pipeline) ------------------------
 
@@ -104,6 +113,7 @@ class Engine:
         self.status_until = 0.0
         self._last_frame = None      # most recent raw frame (for HSV sampling)
         self._last_best = None
+        self._last_blob = False      # is the current lock from the colour-blob fallback?
         self._reset_state()
 
     # -- state ------------------------------------------------------------
@@ -254,11 +264,12 @@ class Engine:
         result = self.cv_worker.get_latest()
         if result is None:
             return None
-        frame, _wi, now, mask, best = result
+        frame, _wi, now, mask, best, blob = result
 
         with self.lock:
             self._last_frame = frame
             self._last_best = best
+            self._last_blob = bool(blob) and best is not None
 
         self.fps_window.append(now)
         if len(self.fps_window) >= 2:
@@ -387,6 +398,7 @@ class Engine:
                 "hsv": self.hsv_bounds(),
                 "status": (self.status if time.time() <= self.status_until else ""),
                 "last_summary": self.last_summary,
+                "blob_lock": self._last_blob,
             }
 
     # -- HUD --------------------------------------------------------------
@@ -424,8 +436,13 @@ class Engine:
         if best is not None and self.last_seen_pos is not None:
             cx, cy = int(self.last_seen_pos[0]), int(self.last_seen_pos[1])
             rr = int(self.last_known_r or 0)
-            cv2.circle(frame, (cx, cy), max(rr, 3), (0, 255, 255), 2, cv2.LINE_AA)
+            ring = (255, 0, 255) if self._last_blob else (0, 255, 255)
+            cv2.circle(frame, (cx, cy), max(rr, 3), ring, 2, cv2.LINE_AA)
             cv2.circle(frame, (cx, cy), 3, (0, 0, 255), -1, cv2.LINE_AA)
+            if self._last_blob:
+                cv2.putText(frame, "blur-lock", (cx - 30, cy - max(rr, 3) - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1,
+                            cv2.LINE_AA)
 
         self._chip(frame, f"REPS {self.rep_count}", w - 12, 56, (90, 255, 120), 1.0)
         self._chip(frame, f"CPM {cpm:.0f}", w - 12, 98, (0, 220, 255), 0.7)
@@ -798,13 +815,15 @@ class Runner:
         self.flip180 = bool(d.get("flip180", False))
         self.loose_lock = bool(d.get("loose", False))
         self.engine.cv_worker.loose_lock = self.loose_lock
+        for k, v in (d.get("tune") or {}).items():
+            self.set_tune(k, v, save=False)
 
     def _save_runtime(self):
         try:
             with open(RUNTIME_PATH, "w") as f:
                 json.dump({"preset": self.current_preset, "wall": self.wall_side,
                            "min_ball": self.min_ball, "flip180": self.flip180,
-                           "loose": self.loose_lock}, f)
+                           "loose": self.loose_lock, "tune": self.tune_values()}, f)
         except Exception:
             pass
 
@@ -838,6 +857,24 @@ class Runner:
         self.engine.cv_worker.loose_lock = self.loose_lock
         self.engine._flash("loose lock: " + ("on" if self.loose_lock else "off"))
         self._save_runtime()
+
+    def set_tune(self, key, value, save=True):
+        spec = TUNE_KEYS.get(key)
+        if spec is None:
+            return None
+        attr, (lo, hi) = spec
+        try:
+            v = max(lo, min(hi, float(value)))
+        except (TypeError, ValueError):
+            return None
+        setattr(wb, attr, v)            # module attr; read live by loop/worker
+        if save:
+            self.engine._flash(f"{key} = {v:g}")
+            self._save_runtime()
+        return v
+
+    def tune_values(self):
+        return {k: getattr(wb, attr) for k, (attr, _r) in TUNE_KEYS.items()}
 
     def _do_apply_preset(self, pid):
         """Run in the loop thread: reopen the camera at the new resolution."""
@@ -1093,6 +1130,7 @@ def api_config():
         "min_ball": runner.min_ball,
         "flip180": runner.flip180,
         "loose": runner.loose_lock,
+        "tune": runner.tune_values(),
         "presets": {k: v["label"] for k, v in RES_PRESETS.items()},
     })
 
@@ -1130,6 +1168,13 @@ def api_loose():
     on = (request.get_json(silent=True) or {}).get("on")
     runner.set_loose(on)
     return jsonify({"ok": True, "loose": runner.loose_lock})
+
+
+@app.route("/api/tune", methods=["POST"])
+def api_tune():
+    d = request.get_json(silent=True) or {}
+    v = runner.set_tune(d.get("key"), d.get("value"))
+    return jsonify({"ok": v is not None, "value": v})
 
 
 @app.route("/api/hsv", methods=["GET", "POST"])
