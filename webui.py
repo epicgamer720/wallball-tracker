@@ -714,6 +714,8 @@ class Runner:
         self.min_ball = RES_PRESETS[self.current_preset]["minr"]
         self.engine.cv_worker.min_ball_radius_px = self.min_ball
         self._pending_preset = None
+        self.flip180 = False        # rotate 180 in capture (upside-down mount)
+        self.loose_lock = False     # blur-tolerant tracking (colour-blob fallback)
         self._load_runtime()
         # optional on-screen UI on the Pi's monitor + 3-button input
         self.buttons = ButtonInput(btn_pins) if (screen and btn_pins) else None
@@ -793,12 +795,16 @@ class Runner:
         if isinstance(d.get("min_ball"), (int, float)):
             self.min_ball = int(d["min_ball"])
             self.engine.cv_worker.min_ball_radius_px = self.min_ball
+        self.flip180 = bool(d.get("flip180", False))
+        self.loose_lock = bool(d.get("loose", False))
+        self.engine.cv_worker.loose_lock = self.loose_lock
 
     def _save_runtime(self):
         try:
             with open(RUNTIME_PATH, "w") as f:
                 json.dump({"preset": self.current_preset, "wall": self.wall_side,
-                           "min_ball": self.min_ball}, f)
+                           "min_ball": self.min_ball, "flip180": self.flip180,
+                           "loose": self.loose_lock}, f)
         except Exception:
             pass
 
@@ -820,6 +826,17 @@ class Runner:
         self.engine.cv_worker.min_ball_radius_px = self.min_ball
         wb.MIN_BALL_RADIUS_PX = self.min_ball
         self.engine._flash(f"min ball size: {self.min_ball}px")
+        self._save_runtime()
+
+    def set_flip(self, on):
+        self.flip180 = bool(on)
+        self.engine._flash("camera flip 180: " + ("on" if self.flip180 else "off"))
+        self._save_runtime()
+
+    def set_loose(self, on):
+        self.loose_lock = bool(on)
+        self.engine.cv_worker.loose_lock = self.loose_lock
+        self.engine._flash("loose lock: " + ("on" if self.loose_lock else "off"))
         self._save_runtime()
 
     def _do_apply_preset(self, pid):
@@ -872,6 +889,8 @@ class Runner:
                 ok, frame = self.raw_read()
                 if not ok:
                     frame = None
+                elif self.flip180:
+                    frame = cv2.rotate(frame, cv2.ROTATE_180)
 
             now_t = time.time()
             do_encode = (now_t - self._last_encode) >= self._encode_dt
@@ -1072,6 +1091,8 @@ def api_config():
         "preset": runner.current_preset,
         "wall": runner.wall_side,
         "min_ball": runner.min_ball,
+        "flip180": runner.flip180,
+        "loose": runner.loose_lock,
         "presets": {k: v["label"] for k, v in RES_PRESETS.items()},
     })
 
@@ -1095,6 +1116,20 @@ def api_wall():
     side = (request.get_json(silent=True) or {}).get("side")
     runner.set_wall(side)
     return jsonify({"ok": True, "wall": runner.wall_side})
+
+
+@app.route("/api/flip", methods=["POST"])
+def api_flip():
+    on = (request.get_json(silent=True) or {}).get("on")
+    runner.set_flip(on)
+    return jsonify({"ok": True, "flip180": runner.flip180})
+
+
+@app.route("/api/loose", methods=["POST"])
+def api_loose():
+    on = (request.get_json(silent=True) or {}).get("on")
+    runner.set_loose(on)
+    return jsonify({"ok": True, "loose": runner.loose_lock})
 
 
 @app.route("/api/hsv", methods=["GET", "POST"])

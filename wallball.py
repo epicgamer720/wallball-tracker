@@ -191,6 +191,18 @@ FRAGMENT_CENTER_TOL     = 0.45   # fitted center within anchor.r * this of ancho
 FRAGMENT_RADIUS_TOL     = 0.30   # fitted radius within 30% of anchor radius
 FRAGMENT_RESIDUAL_PX    = 4.0    # median |dist-to-circle| must be <= this
 
+# Loose-lock mode (opt-in via the Debug toggle).  Trades a little false-positive
+# risk for not losing the ball: drops the circularity gate (so blurry/partial
+# shapes still qualify) and, when no clean contour passes at all, falls back to
+# the CENTROID of the right-coloured mass within a window around the anchor.
+# That leverages "there's a smear of the right colour here, just not round
+# enough for a normal lock" to keep tracking through fast motion.  The window +
+# fill threshold stop it latching onto stray colour far from the last position.
+LOOSE_LOCK_CIRC      = 0.20      # circularity gate while loose-lock is on (anchor/ghost only)
+BLOB_WIN_R           = 2.6       # colour-blob search half-window = this * anchor.r
+BLOB_WIN_MIN_PX      = 26.0      # ...but at least this half-width (detection-res px)
+BLOB_MIN_FILL        = 0.18      # need >= this fraction of the anchor disc filled with colour
+
 # Parabolic-fit thresholds — loosened so fast, blurry, near-straight wall
 # ball throws still produce a candidate.  The speed gates below do the real
 # filtering of fake/idle motion.
@@ -520,6 +532,31 @@ def _try_fragment_circle_fit(contours, anchor):
     return (float(fcx), float(fcy), float(fr))
 
 
+def _color_blob_centroid(mask, ax_m, ay_m, ar_m):
+    """Centroid of the coloured (non-zero) mask pixels inside a window around
+    (ax_m, ay_m) — all in mask/detection-resolution coords.  Returns
+    (cx_m, cy_m) or None if there isn't enough coloured mass.
+
+    Loose-lock's last resort: a fast/blurred ball smears into a non-round patch
+    of the right colour that fails every shape gate.  Tracking the colour
+    centroid in a tight window around the anchor keeps the lock with no shape
+    requirement; the window + fill threshold keep it from grabbing stray colour."""
+    half = max(ar_m * BLOB_WIN_R, BLOB_WIN_MIN_PX)
+    mh, mw = mask.shape[:2]
+    x0 = max(int(ax_m - half), 0); x1 = min(int(ax_m + half), mw)
+    y0 = max(int(ay_m - half), 0); y1 = min(int(ay_m + half), mh)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    roi = mask[y0:y1, x0:x1]
+    need = max(BLOB_MIN_FILL * math.pi * ar_m * ar_m, float(FRAGMENT_MIN_AREA))
+    if cv2.countNonZero(roi) < need:
+        return None
+    m = cv2.moments(roi, binaryImage=True)
+    if m["m00"] <= 0:
+        return None
+    return (x0 + m["m10"] / m["m00"], y0 + m["m01"] / m["m00"])
+
+
 class MaskContourWorker:
     """Background pipeline stage that does the heavy CV work — HSV mask,
     morphology, contour finding, ball-shape scoring — on its own thread.
@@ -546,6 +583,9 @@ class MaskContourWorker:
         self.min_ball_radius_px     = MIN_BALL_RADIUS_PX
         # Relaxed circularity for ghost-anchor re-acquire (tunable at runtime).
         self.ghost_reacquire_circ   = GHOST_REACQUIRE_CIRC
+        # Loose-lock mode (set at runtime from the web UI): drop the shape gate
+        # and enable the colour-blob fallback so blur keeps the lock.
+        self.loose_lock             = False
         self._in_q   = queue.Queue(maxsize=1)
         self._out_q  = queue.Queue(maxsize=1)
         self._stop   = False
@@ -607,6 +647,12 @@ class MaskContourWorker:
             else:
                 min_r  = self.min_radius_px_strict
                 min_c  = self.min_circularity_strict
+            # Loose-lock: with a spatial prior (anchor/ghost) drop the gates so
+            # blurry/partial shapes qualify.  Cold-start stays selective (no
+            # prior -> low circ would latch onto any coloured noise).
+            if self.loose_lock and (anchor is not None or ghost_anchor is not None):
+                min_c = min(min_c, LOOSE_LOCK_CIRC)
+                min_r = min(min_r, self.min_ball_radius_px)
             # Absolute floor — never accept a ball smaller than this, in any
             # mode.  Kills tiny-speck lock-on and anchor ratcheting.
             min_r = max(min_r, self.min_ball_radius_px)
@@ -618,6 +664,7 @@ class MaskContourWorker:
                 # the display frame stays full-resolution and sharp.
                 fh, fw = frame.shape[:2]
                 ms = 640.0 / fw if fw > 640 else 1.0
+                inv = 1.0 / ms                  # mask-coords -> full-res scale
                 src = (cv2.resize(frame, (int(fw * ms), int(fh * ms)),
                                   interpolation=cv2.INTER_LINEAR)
                        if ms < 1.0 else frame)
@@ -635,7 +682,6 @@ class MaskContourWorker:
                 contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                                cv2.CHAIN_APPROX_SIMPLE)
                 if ms < 1.0 and contours:
-                    inv = 1.0 / ms
                     contours = [np.round(c.astype(np.float32) * inv).astype(np.int32)
                                 for c in contours]
                 best, best_score = None, 0.0
@@ -723,6 +769,19 @@ class MaskContourWorker:
                         synth = _try_fragment_circle_fit(contours, anchor)
                         if synth is not None:
                             best = synth
+
+                # --- Colour-blob fallback (loose-lock only). -------------
+                # Nothing passed even the relaxed gates and geometric fit, but
+                # in loose-lock we still track a blurred smear of the right
+                # colour by its centroid in a window around the anchor.  Keeps
+                # the lock through fast motion; off by default.
+                if (self.loose_lock and best is None
+                        and anchor is not None and anchor[2] > 0):
+                    c = _color_blob_centroid(mask, anchor[0] * ms,
+                                             anchor[1] * ms, anchor[2] * ms)
+                    if c is not None:
+                        best = (float(c[0] * inv), float(c[1] * inv),
+                                float(anchor[2]))
             except Exception:
                 continue
             # Replace any stale output with the new result.

@@ -18,6 +18,25 @@
   <p class="caption" style="margin-top:10px">Switching resolution briefly reopens the
     camera (the preview blinks for a second). Both choices are remembered across restarts.</p>
   <div class="spacer"></div>
+  <div class="grid cols-2">
+    <div>
+      <div class="muted" style="margin-bottom:8px">Camera orientation</div>
+      <div class="row">
+        <button id="flipBtn" onclick="toggleFlip()">&#8635; Flip 180&deg;</button>
+      </div>
+      <p class="caption" style="margin-top:8px">Use only if the camera is mounted
+        upside-down. After flipping, re-check the wall side above.</p>
+    </div>
+    <div>
+      <div class="muted" style="margin-bottom:8px">Lock mode</div>
+      <div class="row">
+        <button id="looseBtn" onclick="toggleLoose()">Loose lock</button>
+      </div>
+      <p class="caption" style="margin-top:8px">Tracks blurry/partial colour smears to hold
+        the lock through fast motion &mdash; more forgiving, slightly more false locks.</p>
+    </div>
+  </div>
+  <div class="spacer"></div>
   <div class="muted" style="margin-bottom:8px">App</div>
   <div class="row">
     <button onclick="restartApp()" title="Restart the tracker program">&#8635; Restart app</button>
@@ -110,11 +129,24 @@ function markWall(wall) {
   document.getElementById('wallLeft').classList.toggle('primary', wall === 'left');
   document.getElementById('wallRight').classList.toggle('primary', wall === 'right');
 }
+function markFlip(on) { document.getElementById('flipBtn').classList.toggle('primary', !!on); }
+function markLoose(on) { document.getElementById('looseBtn').classList.toggle('primary', !!on); }
+async function toggleFlip() {
+  const cur = document.getElementById('flipBtn').classList.contains('primary');
+  const r = await postJSON('/api/flip', { on: !cur });
+  markFlip(r.flip180); setNavStatus('camera flip ' + (r.flip180 ? 'on' : 'off'));
+}
+async function toggleLoose() {
+  const cur = document.getElementById('looseBtn').classList.contains('primary');
+  const r = await postJSON('/api/loose', { on: !cur });
+  markLoose(r.loose); setNavStatus('loose lock ' + (r.loose ? 'on' : 'off'));
+}
 async function loadConfig() {
   const c = await api('/api/config');
   document.getElementById('resBtns').innerHTML = Object.entries(c.presets).map(
     ([id, label]) => `<button data-pid="${id}" onclick="setRes('${id}')">${label}</button>`).join('');
   markRes(c.preset); markWall(c.wall);
+  markFlip(c.flip180); markLoose(c.loose);
 }
 async function setRes(pid) {
   const r = await postJSON('/api/resolution', { preset: pid });
