@@ -68,6 +68,11 @@
 {% endblock %}
 
 {% block script %}
+<style>
+/* metronome button flashes on each beat so it's obvious it's running */
+#metrobtn { transition: transform .09s ease-out, filter .09s ease-out; }
+#metrobtn.beat { transform: scale(1.1); filter: brightness(1.6); }
+</style>
 <script>
 let cad;
 function initChart() {
@@ -217,11 +222,17 @@ function resetBreak() {
 }
 function toggleSound() {
   SOUND = !SOUND; localStorage.setItem('wb_sound', SOUND ? '1' : '0');
-  document.getElementById('soundbtn').textContent = SOUND ? '🔊 Cues on' : '🔇 Cues off';
+  const b = document.getElementById('soundbtn');
+  b.textContent = SOUND ? '🔊 Cues on' : '🔇 Cues off';
+  b.classList.toggle('primary', SOUND);
   if (SOUND) { ensureAudio(); beep(880, 0.09); say('cues on'); }
 }
 // Metronome: a steady tick at the target cadence — match it by ear.
-function metroTick() { beep(1000, 0.045, 0, 0.22, 'square'); }
+function metroTick() {
+  beep(1000, 0.045, 0, 0.22, 'square');
+  const b = document.getElementById('metrobtn');
+  if (b) { b.classList.add('beat'); setTimeout(() => b.classList.remove('beat'), 100); }
+}
 function startMetro() {
   stopMetro();
   if (!METRO) return;
@@ -231,14 +242,20 @@ function startMetro() {
 function stopMetro() { if (metroTimer) { clearInterval(metroTimer); metroTimer = null; } }
 function toggleMetro() {
   METRO = !METRO; localStorage.setItem('wb_metro', METRO ? '1' : '0');
-  document.getElementById('metrobtn').textContent = METRO ? '🎵 Metronome on' : '🎵 Metronome';
+  const b = document.getElementById('metrobtn');
+  b.textContent = METRO ? '🎵 Metronome on' : '🎵 Metronome off';
+  b.classList.toggle('primary', METRO);
   if (METRO) { ensureAudio(); metroTick(); startMetro(); } else stopMetro();
 }
 function initCoach() {
   document.getElementById('targetval').textContent = TARGET;
   document.getElementById('breakval').textContent = BREAKEVERY || 'off';
-  document.getElementById('soundbtn').textContent = SOUND ? '🔊 Cues on' : '🔇 Cues off';
-  document.getElementById('metrobtn').textContent = METRO ? '🎵 Metronome on' : '🎵 Metronome';
+  const sb = document.getElementById('soundbtn');
+  sb.textContent = SOUND ? '🔊 Cues on' : '🔇 Cues off';
+  sb.classList.toggle('primary', SOUND);
+  const mb = document.getElementById('metrobtn');
+  mb.textContent = METRO ? '🎵 Metronome on' : '🎵 Metronome off';
+  mb.classList.toggle('primary', METRO);
   renderPace();
   if (METRO) startMetro();
   // Browsers require a user gesture before audio can play; unlock on first tap.
